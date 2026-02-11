@@ -1,14 +1,15 @@
 services:
   gopds:
-    build: .
+    image: gopds-local
     container_name: gopds
+    user: "10000:10000" # Use your actual host UID:GID
     ports:
       - "8880:8880"
-    volumes:
-      # Mount your books folder (Read-Only is safer!)
-      - /path/to/your/nas/books:/root/books:ro
-      # Persist the DB and covers
-      - ./data:/root/data
     environment:
-      - BOOK_PATH=/root/books
+      - BOOK_PATH=/app/books
+      - DB_PATH=/app/data/gopds.db
+    volumes:
+      # [Host Path] : [Container Path (matching the ENV above)]
+      - /share/Multimedia/books:/app/books:ro  # Read-only is safer for your books!
+      - ./data:/app/data                        # Read-write for DB and covers
     restart: unless-stopped
