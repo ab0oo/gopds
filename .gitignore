@@ -1,0 +1,16 @@
+# Binaries
+gopds
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Data and SQLite
+data/
+*.db
+*.db-journal
+
+# OS metadata
+.DS_Store
+Thumbs.db

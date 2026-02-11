@@ -1,0 +1,14 @@
+services:
+  gopds:
+    build: .
+    container_name: gopds
+    ports:
+      - "8880:8880"
+    volumes:
+      # Mount your books folder (Read-Only is safer!)
+      - /path/to/your/nas/books:/root/books:ro
+      # Persist the DB and covers
+      - ./data:/root/data
+    environment:
+      - BOOK_PATH=/root/books
+    restart: unless-stopped
