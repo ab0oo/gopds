@@ -85,25 +85,22 @@ func New(db *database.DB) *Scanner {
 }
 
 func (s *Scanner) Start(root string) error {
-	// 1. Resolve the symlink to the real path
+	// Resolve the symlink to the real path
 	realPath, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		log.Printf("❌ Error resolving symlink %s: %v", root, err)
 		return err
 	}
-    
-	// Use realPath instead of root for the walk
-	log.Printf("🚀 Starting scan of %s (resolved to: %s)...", root, realPath)
-
-	stats := struct {
-		Total    int
-		Rescanned int
-		NoMeta   int
-		NoCover  int
-	}{}
 
 	log.Printf("🚀 Starting scan of %s (resolved to: %s)...", root, realPath)
 	start := time.Now()
+
+	stats := struct {
+		Total     int
+		Rescanned int
+		NoMeta    int
+		NoCover   int
+	}{}
 
 	err = filepath.WalkDir(realPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(strings.ToLower(d.Name()), ".epub") {
@@ -119,10 +116,13 @@ func (s *Scanner) Start(root string) error {
 		stats.Rescanned++
 
 		meta, err := ExtractMetadata(path)
-		if err != nil || meta.Title == "" {
+		if err != nil || meta == nil || meta.Title == "" {
 			stats.NoMeta++
-			log.Printf("⚠️  Metadata missing for %s, using filename.", d.Name())
-			meta = &OPF{Title: strings.TrimSuffix(d.Name(), filepath.Ext(d.Name())), Creator: "Unknown Author"}
+			log.Printf("⚠  Metadata missing for %s, using filename.", d.Name())
+			meta = &OPF{
+				Title:   strings.TrimSuffix(d.Name(), filepath.Ext(d.Name())),
+				Creator: "Unknown Author",
+			}
 		}
 
 		book := database.Book{
@@ -135,6 +135,7 @@ func (s *Scanner) Start(root string) error {
 
 		id, err := s.db.SaveBook(book)
 		if err != nil {
+			log.Printf("❌ Error saving book to DB: %v", err)
 			return nil
 		}
 
@@ -155,76 +156,25 @@ func (s *Scanner) Start(root string) error {
 
 	return err
 }
+
 func SaveCover(epubPath string, bookID int) error {
+	// --- PRIORITY 1: EXTERNAL FILESYSTEM ---
+	// Check for cover.jpg sitting in the folder on the NAS.
+	// This ensures we get the high-res 30KB+ file you manually or API downloaded.
+	localCoverPath := filepath.Join(filepath.Dir(epubPath), "cover.jpg")
+	if info, err := os.Stat(localCoverPath); err == nil && !info.IsDir() {
+		return saveExternalCover(localCoverPath, bookID)
+	}
+
+	// --- PRIORITY 2: INTERNAL EXTRACTION ---
+	// If no external cover exists, open the ZIP to find internal art.
 	reader, err := zip.OpenReader(epubPath)
 	if err != nil {
 		return err
 	}
 	defer reader.Close()
 
-	// 1. Find the .opf file (the "map" of the book)
-	var opfPath string
-	for _, f := range reader.File {
-		if strings.HasSuffix(f.Name, ".opf") {
-			opfPath = f.Name
-			break
-		}
-	}
-
-	if opfPath == "" {
-		return fmt.Errorf("could not find OPF file")
-	}
-
-	// 2. Parse the OPF to find the cover reference
-	opfFile, _ := reader.Open(opfPath)
-	var opf OPF
-	xml.NewDecoder(opfFile).Decode(&opf)
-	opfFile.Close()
-
-	var coverHref string
-
-	// Strategy A: Look for EPUB 3 "cover-image" property
-	for _, item := range opf.Manifest {
-		if strings.Contains(item.Properties, "cover-image") {
-			coverHref = item.Href
-			break
-		}
-	}
-
-	// Strategy B: Look for EPUB 2 <meta name="cover" content="ID">
-	if coverHref == "" {
-		var coverID string
-		for _, m := range opf.Meta {
-			if m.Name == "cover" {
-				coverID = m.Content
-				break
-			}
-		}
-		if coverID != "" {
-			for _, item := range opf.Manifest {
-				if item.ID == coverID {
-					coverHref = item.Href
-					break
-				}
-			}
-		}
-	}
-
-	// 3. Resolve the path (OPF paths are relative to the OPF file location)
-	if coverHref != "" {
-		baseDir := filepath.Dir(opfPath)
-		fullCoverPath := filepath.Join(baseDir, coverHref)
-		// Zip paths use forward slashes even on Windows
-		fullCoverPath = filepath.ToSlash(fullCoverPath)
-
-		for _, f := range reader.File {
-			if f.Name == fullCoverPath || f.Name == coverHref {
-				return extractZipFile(f, bookID)
-			}
-		}
-	}
-
-	// Strategy C: Last Resort - Look for common filenames
+	// A. Check for common file names inside the zip (cover.jpg, folder.jpg, etc)
 	for _, f := range reader.File {
 		low := strings.ToLower(f.Name)
 		if (strings.Contains(low, "cover") || strings.Contains(low, "folder")) &&
@@ -233,10 +183,83 @@ func SaveCover(epubPath string, bookID int) error {
 		}
 	}
 
-	return fmt.Errorf("no cover found")
+	// B. Parse the OPF to find the officially designated cover
+	var opfPath string
+	for _, f := range reader.File {
+		if strings.HasSuffix(f.Name, ".opf") {
+			opfPath = f.Name
+			break
+		}
+	}
+
+	if opfPath != "" {
+		rc, _ := reader.Open(opfPath)
+		var opf OPF
+		xml.NewDecoder(rc).Decode(&opf)
+		rc.Close()
+
+		var coverHref string
+		// Try EPUB 3 manifest properties
+		for _, item := range opf.Manifest {
+			if strings.Contains(item.Properties, "cover-image") {
+				coverHref = item.Href
+				break
+			}
+		}
+		// Try EPUB 2 meta tags
+		if coverHref == "" {
+			var coverID string
+			for _, m := range opf.Meta {
+				if m.Name == "cover" {
+					coverID = m.Content
+					break
+				}
+			}
+			if coverID != "" {
+				for _, item := range opf.Manifest {
+					if item.ID == coverID {
+						coverHref = item.Href
+						break
+					}
+				}
+			}
+		}
+
+		if coverHref != "" {
+			baseDir := filepath.Dir(opfPath)
+			fullCoverPath := filepath.ToSlash(filepath.Join(baseDir, coverHref))
+			for _, f := range reader.File {
+				if f.Name == fullCoverPath || f.Name == coverHref {
+					return extractZipFile(f, bookID)
+				}
+			}
+		}
+	}
+
+	return fmt.Errorf("no cover found for %s", epubPath)
 }
 
-// Helper to actually write the file to disk
+// Helper to copy an existing high-quality cover.jpg from the NAS to the data directory
+func saveExternalCover(srcPath string, bookID int) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	os.MkdirAll("./data/covers", 0755)
+	dstPath := fmt.Sprintf("./data/covers/%d.jpg", bookID)
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	_, err = io.Copy(dst, src)
+	return err
+}
+
+// Helper to extract a single file from the EPUB zip to the data directory
 func extractZipFile(f *zip.File, bookID int) error {
 	rc, err := f.Open()
 	if err != nil {
