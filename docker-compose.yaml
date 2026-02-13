@@ -1,7 +1,7 @@
 services:
   gopds:
     build: .
-#    image: gopds-local
+    image: ghcr.io/ab0oo/gopds:latest
     container_name: gopds
     user: "998:998" # Use your actual host UID:GID, this needs to be the owner of the book library for writes
     ports:

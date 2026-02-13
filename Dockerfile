@@ -11,6 +11,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o gopds ./cmd/gopds
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
+LABEL org.opencontainers.image.source="https://github.com/ab0oo/gopds"
 
 # This "builder" matches the name in the first line
 COPY --from=builder /app/gopds .
