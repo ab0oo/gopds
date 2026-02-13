@@ -8,12 +8,12 @@ import (
 )
 
 type Book struct {
-	ID          int
-	Path        string
-	Title       string
-	Author      string
-	Description string
-	ModTime     time.Time
+	ID          int       `json:"id"`
+	Path        string    `json:"path"`
+	Title       string    `json:"title"`
+	Author      string    `json:"author"`
+	Description string    `json:"description"`
+	ModTime     time.Time `json:"mod_time"`
 }
 
 type DB struct {
@@ -36,7 +36,7 @@ func New(dbPath string) (*DB, error) {
 		description TEXT,
 		mod_time DATETIME
 	);`
-	
+
 	if _, err := db.Exec(query); err != nil {
 		return nil, err
 	}
@@ -72,6 +72,15 @@ func (db *DB) SaveBook(b Book) (int64, error) {
 	return result.LastInsertId()
 }
 
+func (db *DB) UpdateBookMetadata(id int, title, author, description string, modTime time.Time) error {
+	query := `
+	UPDATE books
+	SET title = ?, author = ?, description = ?, mod_time = ?
+	WHERE id = ?`
+	_, err := db.conn.Exec(query, title, author, description, modTime, id)
+	return err
+}
+
 // GetAllBooks retrieves every book stored in the database.
 func (db *DB) GetAllBooks() ([]Book, error) {
 	query := "SELECT id, path, title, author, description, mod_time FROM books"
@@ -95,12 +104,10 @@ func (db *DB) GetAllBooks() ([]Book, error) {
 
 func (db *DB) GetBookByID(id string) (*Book, error) {
 	var b Book
-	query := "SELECT id, path, title FROM books WHERE id = ?"
-	err := db.conn.QueryRow(query, id).Scan(&b.ID, &b.Path, &b.Title)
+	query := "SELECT id, path, title, author, description, mod_time FROM books WHERE id = ?"
+	err := db.conn.QueryRow(query, id).Scan(&b.ID, &b.Path, &b.Title, &b.Author, &b.Description, &b.ModTime)
 	if err != nil {
 		return nil, err
 	}
 	return &b, nil
 }
-
-
