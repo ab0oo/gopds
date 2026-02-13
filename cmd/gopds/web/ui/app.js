@@ -23,9 +23,13 @@ const App = {
     coverModalBookId: null,
     openLibraryResults: [],
     selectedOpenLibrary: null,
+    coverCandidatesByKey: {},
     rebuildPollTimer: null,
     lastRebuildCompletedAt: '',
     coverVersion: {},
+    filterAuthor: '__all',
+    filterCategory: '__all',
+    filterSubcategory: '__all',
     auth: {
         authenticated: false,
         username: ''
@@ -34,6 +38,9 @@ const App = {
     ui: {
         library: document.getElementById('library'),
         search: document.getElementById('search'),
+        authorFilter: document.getElementById('author-filter'),
+        categoryFilter: document.getElementById('category-filter'),
+        subcategoryFilter: document.getElementById('subcategory-filter'),
         rescanBtn: document.getElementById('rescan-btn'),
         rebuildBtn: document.getElementById('rebuild-btn'),
         rebuildStatus: document.getElementById('rebuild-status'),
@@ -121,6 +128,9 @@ const App = {
 
     bindEvents() {
         this.ui.search.addEventListener('input', (e) => this.handleSearch(e));
+        this.ui.authorFilter.addEventListener('change', (e) => this.handleAuthorFilterChange(e));
+        this.ui.categoryFilter.addEventListener('change', (e) => this.handleCategoryFilterChange(e));
+        this.ui.subcategoryFilter.addEventListener('change', (e) => this.handleSubcategoryFilterChange(e));
         window.addEventListener('scroll', () => this.handleScroll());
         this.ui.rescanBtn.addEventListener('click', () => this.handleRescanClick());
         this.ui.rebuildBtn.addEventListener('click', () => this.handleRebuildClick());
@@ -157,6 +167,7 @@ const App = {
             }
         });
         this.ui.coverModalApply.addEventListener('click', () => this.applyCoverSelection());
+        this.ui.coverFetchOnline.addEventListener('click', () => this.fetchOnlineCoverCandidates());
 
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape' && !this.ui.modal.classList.contains('hidden')) {
@@ -181,6 +192,9 @@ const App = {
                 </div>
                 <div class="modal-book" id="cover-modal-book"></div>
                 <div class="cover-status" id="cover-modal-status">Loading cover candidates...</div>
+                <div class="cover-online-actions">
+                    <button type="button" id="cover-fetch-online">Find Online Covers</button>
+                </div>
                 <div class="cover-grid" id="cover-grid"></div>
                 <label class="cover-write-flag">
                     <input type="checkbox" id="cover-write-epub">
@@ -197,6 +211,7 @@ const App = {
         this.ui.coverModalClose = modal.querySelector('#cover-modal-close');
         this.ui.coverModalBook = modal.querySelector('#cover-modal-book');
         this.ui.coverModalStatus = modal.querySelector('#cover-modal-status');
+        this.ui.coverFetchOnline = modal.querySelector('#cover-fetch-online');
         this.ui.coverGrid = modal.querySelector('#cover-grid');
         this.ui.coverWriteEPUB = modal.querySelector('#cover-write-epub');
         this.ui.coverModalApply = modal.querySelector('#cover-apply');
@@ -210,9 +225,9 @@ const App = {
             }
 
             this.allBooks = await response.json();
-            this.filteredBooks = [...this.allBooks];
             this.ui.search.placeholder = `Search ${this.allBooks.length} books...`;
-            this.render(true);
+            this.refreshBrowseFilters();
+            this.applyFiltersAndRender();
         } catch (err) {
             this.ui.library.innerText = 'Error loading library. Check console.';
             console.error(err);
@@ -430,11 +445,164 @@ const App = {
     },
 
     handleSearch(e) {
-        const term = e.target.value.toLowerCase();
-        this.filteredBooks = this.allBooks.filter((b) =>
-            (b.title || '').toLowerCase().includes(term) ||
-            (b.author || '').toLowerCase().includes(term)
-        );
+        this.applyFiltersAndRender();
+    },
+
+    handleAuthorFilterChange(e) {
+        this.filterAuthor = e.target.value || '__all';
+        this.applyFiltersAndRender();
+    },
+
+    handleCategoryFilterChange(e) {
+        this.filterCategory = e.target.value || '__all';
+        this.filterSubcategory = '__all';
+        this.refreshSubcategoryFilter();
+        this.applyFiltersAndRender();
+    },
+
+    handleSubcategoryFilterChange(e) {
+        this.filterSubcategory = e.target.value || '__all';
+        this.applyFiltersAndRender();
+    },
+
+    refreshBrowseFilters() {
+        this.refreshAuthorFilter();
+        this.refreshCategoryFilter();
+        this.refreshSubcategoryFilter();
+    },
+
+    refreshAuthorFilter() {
+        const authors = Array.from(
+            new Set(
+                this.allBooks
+                    .map((b) => (b.author || '').trim())
+                    .filter(Boolean)
+            )
+        ).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+
+        const hadUnknown = this.allBooks.some((b) => !(b.author || '').trim());
+        const selected = this.filterAuthor;
+
+        const options = ['<option value="__all">All authors</option>'];
+        if (hadUnknown) {
+            options.push('<option value="__unknown">Unknown author</option>');
+        }
+        authors.forEach((a) => {
+            options.push(`<option value="${this.escapeHTML(a)}">${this.escapeHTML(a)}</option>`);
+        });
+        this.ui.authorFilter.innerHTML = options.join('');
+
+        const canRestore = selected === '__all'
+            || (selected === '__unknown' && hadUnknown)
+            || authors.includes(selected);
+        this.filterAuthor = canRestore ? selected : '__all';
+        this.ui.authorFilter.value = this.filterAuthor;
+    },
+
+    refreshCategoryFilter() {
+        const categories = Array.from(
+            new Set(
+                this.allBooks
+                    .map((b) => (b.category || '').trim())
+                    .filter(Boolean)
+            )
+        ).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+
+        const hadUncategorized = this.allBooks.some((b) => !(b.category || '').trim());
+        const selected = this.filterCategory;
+
+        const options = ['<option value="__all">All categories</option>'];
+        if (hadUncategorized) {
+            options.push('<option value="__uncat">Uncategorized</option>');
+        }
+        categories.forEach((c) => {
+            options.push(`<option value="${this.escapeHTML(c)}">${this.escapeHTML(c)}</option>`);
+        });
+
+        this.ui.categoryFilter.innerHTML = options.join('');
+        const canRestore = selected === '__all'
+            || (selected === '__uncat' && hadUncategorized)
+            || categories.includes(selected);
+        this.filterCategory = canRestore ? selected : '__all';
+        this.ui.categoryFilter.value = this.filterCategory;
+    },
+
+    refreshSubcategoryFilter() {
+        const selectedCategory = this.filterCategory;
+        if (selectedCategory === '__all' || selectedCategory === '__uncat') {
+            this.ui.subcategoryFilter.innerHTML = '<option value="__all">All sub-categories</option>';
+            this.ui.subcategoryFilter.disabled = true;
+            this.filterSubcategory = '__all';
+            return;
+        }
+
+        const inCategory = this.allBooks.filter((b) => ((b.category || '').trim()) === selectedCategory);
+        const subcategories = Array.from(
+            new Set(inCategory.map((b) => (b.subcategory || '').trim()).filter(Boolean))
+        ).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+        const hasNoSubcategory = inCategory.some((b) => !(b.subcategory || '').trim());
+
+        const selected = this.filterSubcategory;
+        const options = ['<option value="__all">All sub-categories</option>'];
+        if (hasNoSubcategory) {
+            options.push('<option value="__none">No sub-category</option>');
+        }
+        subcategories.forEach((s) => {
+            options.push(`<option value="${this.escapeHTML(s)}">${this.escapeHTML(s)}</option>`);
+        });
+        this.ui.subcategoryFilter.innerHTML = options.join('');
+        this.ui.subcategoryFilter.disabled = false;
+
+        const canRestore = selected === '__all'
+            || (selected === '__none' && hasNoSubcategory)
+            || subcategories.includes(selected);
+        this.filterSubcategory = canRestore ? selected : '__all';
+        this.ui.subcategoryFilter.value = this.filterSubcategory;
+    },
+
+    applyFiltersAndRender() {
+        const term = (this.ui.search.value || '').toLowerCase();
+        this.filteredBooks = this.allBooks.filter((b) => {
+            const author = (b.author || '').trim();
+            const category = (b.category || '').trim();
+            const subcategory = (b.subcategory || '').trim();
+
+            let authorMatch = true;
+            if (this.filterAuthor === '__unknown') {
+                authorMatch = author === '';
+            } else if (this.filterAuthor !== '__all') {
+                authorMatch = author === this.filterAuthor;
+            }
+            if (!authorMatch) {
+                return false;
+            }
+
+            let categoryMatch = true;
+            if (this.filterCategory === '__uncat') {
+                categoryMatch = category === '';
+            } else if (this.filterCategory !== '__all') {
+                categoryMatch = category === this.filterCategory;
+            }
+            if (!categoryMatch) {
+                return false;
+            }
+
+            let subcategoryMatch = true;
+            if (this.filterSubcategory === '__none') {
+                subcategoryMatch = subcategory === '';
+            } else if (this.filterSubcategory !== '__all') {
+                subcategoryMatch = subcategory === this.filterSubcategory;
+            }
+            if (!subcategoryMatch) {
+                return false;
+            }
+
+            if (!term) {
+                return true;
+            }
+            return (b.title || '').toLowerCase().includes(term) ||
+                (b.author || '').toLowerCase().includes(term);
+        });
         this.render(true);
     },
 
@@ -484,6 +652,7 @@ const App = {
             return;
         }
         this.coverModalBookId = book.id;
+        this.coverCandidatesByKey = {};
         this.ui.coverModalBook.textContent = `Book #${book.id} | ${book.title || 'Untitled'}`;
         this.ui.coverModalStatus.textContent = 'Loading cover candidates...';
         this.ui.coverGrid.innerHTML = '';
@@ -501,6 +670,7 @@ const App = {
             }
             const payload = await response.json();
             const candidates = payload.candidates || [];
+            this.coverCandidatesByKey = {};
             if (candidates.length === 0) {
                 this.ui.coverModalStatus.textContent = 'No suitable cover images found in this EPUB.';
                 this.ui.coverModalApply.disabled = true;
@@ -519,18 +689,97 @@ const App = {
 
     closeCoverModal() {
         this.coverModalBookId = null;
+        this.coverCandidatesByKey = {};
         this.ui.coverModal.classList.add('hidden');
     },
 
     renderCoverCandidates(candidates) {
+        this.coverCandidatesByKey = {};
+        candidates.forEach((c) => {
+            if (c && c.key) {
+                this.coverCandidatesByKey[c.key] = c;
+            }
+        });
+
         this.ui.coverGrid.innerHTML = candidates.map((c, idx) => `
             <label class="cover-option">
                 <input type="radio" name="cover-candidate" value="${this.escapeHTML(c.key)}" ${c.is_current || idx === 0 ? 'checked' : ''}>
                 <img src="${this.escapeHTML(c.preview_url)}" alt="${this.escapeHTML(c.name)}">
                 <span>${this.escapeHTML(c.name)}</span>
-                <small>${c.width}x${c.height} ${this.escapeHTML(c.media_type || '')}${c.is_current ? ' | current' : ''}</small>
+                <small>${c.width > 0 && c.height > 0 ? `${c.width}x${c.height} ` : ''}${this.escapeHTML(c.media_type || '')}${c.source ? ` | ${this.escapeHTML(c.source)}` : ''}${c.is_current ? ' | current' : ''}</small>
             </label>
         `).join('');
+    },
+
+    async fetchOnlineCoverCandidates() {
+        if (!this.coverModalBookId) {
+            return;
+        }
+        console.info('[covers] online lookup start', {
+            bookId: this.coverModalBookId
+        });
+        this.ui.coverFetchOnline.disabled = true;
+        this.ui.coverModalStatus.textContent = 'Searching online covers (Wikipedia/Open Library)...';
+        try {
+            const response = await fetch(`/api/books/${this.coverModalBookId}/covers/online`);
+            console.info('[covers] online lookup response', {
+                bookId: this.coverModalBookId,
+                status: response.status,
+                ok: response.ok
+            });
+            if (!response.ok) {
+                const msg = await response.text();
+                console.warn('[covers] online lookup failed', {
+                    bookId: this.coverModalBookId,
+                    status: response.status,
+                    message: msg
+                });
+                throw new Error(msg || `Online cover lookup failed (${response.status})`);
+            }
+            const payload = await response.json();
+            const incoming = payload.candidates || [];
+            console.info('[covers] online lookup payload', {
+                bookId: this.coverModalBookId,
+                candidateCount: incoming.length,
+                candidates: incoming.map((c) => ({
+                    key: c.key,
+                    source: c.source,
+                    name: c.name,
+                    image_url: c.image_url
+                }))
+            });
+            if (incoming.length === 0) {
+                this.ui.coverModalStatus.textContent = 'No online covers found for this title.';
+                return;
+            }
+
+            const mergedMap = { ...this.coverCandidatesByKey };
+            incoming.forEach((c) => {
+                if (c && c.key && !mergedMap[c.key]) {
+                    mergedMap[c.key] = c;
+                }
+            });
+            const merged = Object.values(mergedMap);
+            this.renderCoverCandidates(merged);
+            console.info('[covers] online lookup merged', {
+                bookId: this.coverModalBookId,
+                totalVisibleCandidates: merged.length
+            });
+            this.ui.coverModalStatus.textContent = `Added ${incoming.length} online candidates.`;
+            this.ui.coverModalApply.disabled = false;
+        } catch (err) {
+            console.error('[covers] online lookup exception', {
+                bookId: this.coverModalBookId,
+                error: err && err.message ? err.message : String(err)
+            });
+            this.ui.coverModalStatus.textContent = `Error: ${err.message}`;
+            console.error(err);
+        } finally {
+            this.ui.coverFetchOnline.disabled = false;
+            console.info('[covers] online lookup end', {
+                bookId: this.coverModalBookId
+            });
+        }
     },
 
     async applyCoverSelection() {
@@ -551,11 +800,13 @@ const App = {
         this.ui.coverModalStatus.textContent = 'Applying cover...';
 
         try {
+            const pickedCandidate = this.coverCandidatesByKey[picked.value];
             const response = await fetch(`/api/books/${this.coverModalBookId}/cover`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     key: picked.value,
+                    image_url: pickedCandidate && pickedCandidate.remote ? pickedCandidate.image_url : '',
                     write_to_epub: Boolean(this.ui.coverWriteEPUB.checked)
                 })
             });
@@ -684,7 +935,7 @@ const App = {
             const updated = await response.json();
             this.fillLocalFields(updated);
             this.updateBookCardStateFromMetadata(updated);
-            this.render(true);
+            this.applyFiltersAndRender();
             this.ui.modalStatus.textContent = 'Saved to EPUB and DB cache.';
             this.closeModal();
         } catch (err) {

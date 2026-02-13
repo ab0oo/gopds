@@ -30,9 +30,10 @@ type Container struct {
 }
 
 type OPF struct {
-	Title       string `xml:"metadata>title"`
-	Creator     string `xml:"metadata>creator"`
-	Description string `xml:"metadata>description"`
+	Title       string   `xml:"metadata>title"`
+	Creator     string   `xml:"metadata>creator"`
+	Description string   `xml:"metadata>description"`
+	Subjects    []string `xml:"metadata>subject"`
 	Meta        []struct {
 		Name    string `xml:"name,attr"`
 		Content string `xml:"content,attr"`
@@ -111,9 +112,21 @@ func ExtractMetadata(path string) (*OPF, error) {
 			}
 			defer rc.Close()
 
-			var opf OPF
-			if err := xml.NewDecoder(rc).Decode(&opf); err != nil {
+			opfContent, err := io.ReadAll(rc)
+			if err != nil {
 				return nil, err
+			}
+
+			var opf OPF
+			if err := xml.Unmarshal(opfContent, &opf); err != nil {
+				return nil, err
+			}
+			if len(opf.Subjects) == 0 {
+				if metaBlock, err := extractMetadataBlock(opfContent); err == nil {
+					opf.Subjects = extractAllTagValues(metaBlock, "subject")
+				}
+			} else {
+				opf.Subjects = normalizeSubjectList(opf.Subjects)
 			}
 			return &opf, nil
 		}
@@ -588,7 +601,7 @@ func (s *Scanner) Start(root string) error {
 
 	log.Printf("🚀 Starting scan of %s (resolved to: %s)...", root, realPath)
 	start := time.Now()
-	usePathCategories := isPathCategoryEnabled()
+	categorySource := resolveCategorySource()
 
 	stats := struct {
 		Total     int
@@ -633,8 +646,16 @@ func (s *Scanner) Start(root string) error {
 			Description: meta.Description,
 			ModTime:     info.ModTime(),
 		}
-		if usePathCategories {
+		switch categorySource {
+		case "path":
 			book.Category, book.Subcategory = categoriesFromPath(realPath, path)
+		case "subject":
+			book.Category, book.Subcategory = categoriesFromSubjects(meta.Subjects)
+		case "auto":
+			book.Category, book.Subcategory = categoriesFromSubjects(meta.Subjects)
+			if book.Category == "" {
+				book.Category, book.Subcategory = categoriesFromPath(realPath, path)
+			}
 		}
 
 		id, err := s.db.SaveBookTx(tx, book)
@@ -673,6 +694,30 @@ func isPathCategoryEnabled() bool {
 	return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
 }
 
+func isSubjectCategoryEnabled() bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("CATEGORY_FROM_SUBJECT")))
+	return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+}
+
+func resolveCategorySource() string {
+	source := strings.ToLower(strings.TrimSpace(os.Getenv("CATEGORY_SOURCE")))
+	switch source {
+	case "path", "subject", "auto", "none":
+		return source
+	case "":
+		// Backward compatibility with old toggles.
+		if isSubjectCategoryEnabled() {
+			return "subject"
+		}
+		if isPathCategoryEnabled() {
+			return "path"
+		}
+		return "none"
+	default:
+		return "none"
+	}
+}
+
 func categoriesFromPath(root, bookPath string) (string, string) {
 	root = filepath.Clean(root)
 	bookPath = filepath.Clean(bookPath)
@@ -694,6 +739,49 @@ func categoriesFromPath(root, bookPath string) (string, string) {
 		subcategory = strings.TrimSpace(parts[1])
 	}
 	return category, subcategory
+}
+
+func categoriesFromSubjects(subjects []string) (string, string) {
+	clean := normalizeSubjectList(subjects)
+	if len(clean) == 0 {
+		return "", ""
+	}
+
+	for _, sep := range []string{" > ", ">", "/", "|", "::", "»"} {
+		if strings.Contains(clean[0], sep) {
+			parts := normalizeSubjectList(strings.Split(clean[0], sep))
+			if len(parts) >= 2 {
+				return parts[0], parts[1]
+			}
+			if len(parts) == 1 {
+				return parts[0], ""
+			}
+		}
+	}
+
+	category := clean[0]
+	subcategory := ""
+	if len(clean) > 1 {
+		subcategory = clean[1]
+	}
+	return category, subcategory
+}
+
+func normalizeSubjectList(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
 }
 
 func SaveCover(epubPath string, bookID int) error {
@@ -920,6 +1008,59 @@ func WriteCoverToEPUB(epubPath, selectedZipPath string) error {
 	if err != nil {
 		return err
 	}
+
+	return writeNormalizedCoverToEPUB(epubPath, opfPath, opf, opfDir, updatedOPF, rewritten)
+}
+
+func WriteCoverBytesToEPUB(epubPath string, imageBytes []byte) error {
+	reader, err := zip.OpenReader(epubPath)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	opfPath, err := findOPFPath(reader.File)
+	if err != nil {
+		return err
+	}
+	if opfPath == "" {
+		return fmt.Errorf("opf package document not found")
+	}
+	opfContent, err := readZipEntry(reader.File, opfPath)
+	if err != nil {
+		return err
+	}
+	var opf OPF
+	if err := xml.Unmarshal(opfContent, &opf); err != nil {
+		return err
+	}
+	opfDir := filepath.Dir(opfPath)
+	canonicalCoverPath := normalizeZipPath(filepath.Join(opfDir, "cover.jpg"))
+	canonicalHref := relativeHrefFromOPFDir(opfDir, canonicalCoverPath)
+	updatedOPF, err := rewriteOPFCoverReference(opfContent, canonicalHref)
+	if err != nil {
+		return err
+	}
+
+	img, _, err := image.Decode(bytes.NewReader(imageBytes))
+	if err != nil {
+		return fmt.Errorf("remote cover decode failed: %w", err)
+	}
+	rewritten, err := encodeImageForMediaType(img, "image/jpeg", canonicalCoverPath)
+	if err != nil {
+		return err
+	}
+	return writeNormalizedCoverToEPUB(epubPath, opfPath, opf, opfDir, updatedOPF, rewritten)
+}
+
+func writeNormalizedCoverToEPUB(epubPath, opfPath string, opf OPF, opfDir string, updatedOPF []byte, rewritten []byte) error {
+	reader, err := zip.OpenReader(epubPath)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	canonicalCoverPath := normalizeZipPath(filepath.Join(opfDir, "cover.jpg"))
 
 	tempFile, err := os.CreateTemp(filepath.Dir(epubPath), ".gopds-cover-*.epub")
 	if err != nil {

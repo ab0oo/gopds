@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"crypto/rand"
 	"database/sql"
 	"embed"
@@ -10,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"image"
 	"io"
 	"io/fs"
 	"log"
@@ -116,11 +118,15 @@ type coverCandidate struct {
 	Height     int    `json:"height"`
 	IsCurrent  bool   `json:"is_current"`
 	PreviewURL string `json:"preview_url"`
+	Source     string `json:"source"`
+	Remote     bool   `json:"remote"`
+	ImageURL   string `json:"image_url,omitempty"`
 }
 
 type updateCoverRequest struct {
 	Key         string `json:"key"`
 	WriteToEPUB bool   `json:"write_to_epub"`
+	ImageURL    string `json:"image_url,omitempty"`
 }
 
 type openLibrarySearchResponse struct {
@@ -131,6 +137,7 @@ type openLibrarySearchResponse struct {
 		AuthorName       []string `json:"author_name"`
 		Language         []string `json:"language"`
 		ISBN             []string `json:"isbn"`
+		CoverI           int      `json:"cover_i"`
 		Publisher        []string `json:"publisher"`
 		FirstPublishYear int      `json:"first_publish_year"`
 		Subject          []string `json:"subject"`
@@ -179,6 +186,14 @@ type googleBooksResponse struct {
 				Type       string `json:"type"`
 				Identifier string `json:"identifier"`
 			} `json:"industryIdentifiers"`
+			ImageLinks struct {
+				SmallThumbnail string `json:"smallThumbnail"`
+				Thumbnail      string `json:"thumbnail"`
+				Small          string `json:"small"`
+				Medium         string `json:"medium"`
+				Large          string `json:"large"`
+				ExtraLarge     string `json:"extraLarge"`
+			} `json:"imageLinks"`
 		} `json:"volumeInfo"`
 	} `json:"items"`
 }
@@ -245,6 +260,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/api/books/{id}/metadata/live", s.requireAuth(s.HandleLiveMetadata))
 	r.Put("/api/books/{id}/metadata", s.requireAuth(s.HandleUpdateMetadata))
 	r.Get("/api/books/{id}/covers/candidates", s.requireAuth(s.HandleCoverCandidates))
+	r.Get("/api/books/{id}/covers/online", s.requireAuth(s.HandleOnlineCoverCandidates))
 	r.Get("/api/books/{id}/covers/candidates/{key}", s.requireAuth(s.HandleCoverCandidateImage))
 	r.Put("/api/books/{id}/cover", s.requireAuth(s.HandleUpdateCover))
 	r.Post("/api/admin/rebuild", s.requireAuth(s.HandleRebuildLibrary))
@@ -1056,7 +1072,13 @@ func (s *Server) fetchGoogleBooks(client *http.Client, query string, maxResults 
 }
 
 func fetchJSON(client *http.Client, endpoint string, target interface{}) error {
-	resp, err := client.Get(endpoint)
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	applyOutboundHeaders(req)
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -1075,6 +1097,12 @@ func fetchJSON(client *http.Client, endpoint string, target interface{}) error {
 		return err
 	}
 	return nil
+}
+
+func applyOutboundHeaders(req *http.Request) {
+	// Wikimedia APIs require a descriptive User-Agent; reuse this for all upstream lookups.
+	req.Header.Set("User-Agent", "GoPDS/1.0 (+https://github.com/ab0oo/gopds)")
+	req.Header.Set("Accept", "application/json, image/*;q=0.9, */*;q=0.8")
 }
 
 func dedupeAndMergeCandidates(in []metadataCandidate) []metadataCandidate {
@@ -1381,6 +1409,8 @@ func (s *Server) HandleCoverCandidates(w http.ResponseWriter, r *http.Request) {
 			Height:     c.Height,
 			IsCurrent:  c.IsCurrent,
 			PreviewURL: fmt.Sprintf("/api/books/%d/covers/candidates/%s", book.ID, url.PathEscape(key)),
+			Source:     "epub",
+			Remote:     false,
 		})
 	}
 
@@ -1391,6 +1421,136 @@ func (s *Server) HandleCoverCandidates(w http.ResponseWriter, r *http.Request) {
 	}{
 		BookID:     book.ID,
 		Candidates: out,
+	})
+}
+
+func (s *Server) HandleOnlineCoverCandidates(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	book, err := s.db.GetBookByID(id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "Book not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	bookPath, err := s.resolveBookPath(book)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to locate EPUB: %v", err), http.StatusUnprocessableEntity)
+		return
+	}
+
+	meta, _ := scanner.ExtractLiveMetadata(bookPath)
+	title := strings.TrimSpace(book.Title)
+	author := strings.TrimSpace(book.Author)
+	isbn := ""
+	if meta != nil {
+		if strings.TrimSpace(meta.Title) != "" {
+			title = strings.TrimSpace(meta.Title)
+		}
+		if strings.TrimSpace(meta.Author) != "" {
+			author = strings.TrimSpace(meta.Author)
+		}
+		isbn = normalizeISBN(meta.Identifier)
+	}
+
+	client := &http.Client{Timeout: 12 * time.Second}
+	candidates := make([]coverCandidate, 0, 12)
+	seen := map[string]struct{}{}
+	log.Printf("[covers.online] lookup start book_id=%d title=%q author=%q isbn=%q", book.ID, title, author, isbn)
+
+	// Open Library ISBN cover tends to be high quality when ISBN is available.
+	if isbn != "" {
+		ol := fmt.Sprintf("https://covers.openlibrary.org/b/isbn/%s-L.jpg?default=false", url.PathEscape(isbn))
+		if ok := remoteImageReachable(client, ol); ok {
+			candidates = append(candidates, makeRemoteCoverCandidate(
+				ol,
+				fmt.Sprintf("Open Library ISBN %s", isbn),
+				"openlibrary",
+			))
+			seen[ol] = struct{}{}
+			log.Printf("[covers.online] openlibrary isbn hit book_id=%d url=%s", book.ID, ol)
+		} else {
+			log.Printf("[covers.online] openlibrary isbn miss book_id=%d url=%s", book.ID, ol)
+		}
+	} else {
+		log.Printf("[covers.online] no isbn available for book_id=%d", book.ID)
+	}
+
+	query := strings.TrimSpace(strings.Join([]string{title, author, "book"}, " "))
+	if query != "" || isbn != "" {
+		gb, err := fetchGoogleBookCoverCandidates(client, query, isbn, 8)
+		if err == nil {
+			log.Printf("[covers.online] googlebooks candidates book_id=%d query=%q isbn=%q count=%d", book.ID, query, isbn, len(gb))
+			for _, c := range gb {
+				if _, ok := seen[c.ImageURL]; ok {
+					continue
+				}
+				seen[c.ImageURL] = struct{}{}
+				candidates = append(candidates, c)
+			}
+		} else {
+			log.Printf("[covers.online] googlebooks error book_id=%d query=%q isbn=%q err=%v", book.ID, query, isbn, err)
+		}
+	}
+
+	if query != "" {
+		olSearch, err := fetchOpenLibrarySearchCoverCandidates(client, query, 8)
+		if err == nil {
+			log.Printf("[covers.online] openlibrary search candidates book_id=%d query=%q count=%d", book.ID, query, len(olSearch))
+			for _, c := range olSearch {
+				if _, ok := seen[c.ImageURL]; ok {
+					continue
+				}
+				seen[c.ImageURL] = struct{}{}
+				candidates = append(candidates, c)
+			}
+		} else {
+			log.Printf("[covers.online] openlibrary search error book_id=%d query=%q err=%v", book.ID, query, err)
+		}
+	}
+
+	wikiQueries := make([]string, 0, 2)
+	if query != "" {
+		wikiQueries = append(wikiQueries, query)
+	}
+	if title != "" {
+		wikiQueries = append(wikiQueries, strings.TrimSpace(title+" book"))
+	}
+	for _, q := range wikiQueries {
+		wiki, err := fetchWikipediaCoverCandidates(client, q, 6)
+		if err == nil {
+			log.Printf("[covers.online] wikipedia candidates book_id=%d query=%q count=%d", book.ID, q, len(wiki))
+			for _, c := range wiki {
+				if _, ok := seen[c.ImageURL]; ok {
+					continue
+				}
+				seen[c.ImageURL] = struct{}{}
+				candidates = append(candidates, c)
+			}
+		} else {
+			log.Printf("[covers.online] wikipedia error book_id=%d query=%q err=%v", book.ID, q, err)
+		}
+	}
+
+	if query == "" {
+		log.Printf("[covers.online] empty query for book_id=%d", book.ID)
+	} else {
+		log.Printf("[covers.online] query used for book_id=%d query=%q", book.ID, query)
+	}
+
+	candidates = rankAndFilterOnlineCovers(client, candidates)
+	log.Printf("[covers.online] lookup done book_id=%d total_candidates=%d", book.ID, len(candidates))
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		BookID     int              `json:"book_id"`
+		Candidates []coverCandidate `json:"candidates"`
+	}{
+		BookID:     book.ID,
+		Candidates: candidates,
 	})
 }
 
@@ -1458,21 +1618,32 @@ func (s *Server) HandleUpdateCover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Key = strings.TrimSpace(req.Key)
-	if req.Key == "" {
-		http.Error(w, "Cover key is required", http.StatusBadRequest)
+	req.ImageURL = strings.TrimSpace(req.ImageURL)
+	if req.Key == "" && req.ImageURL == "" {
+		http.Error(w, "Cover key or image_url is required", http.StatusBadRequest)
 		return
 	}
 
-	zipPath, err := decodeCoverKey(req.Key)
-	if err != nil {
-		http.Error(w, "Invalid cover key", http.StatusBadRequest)
-		return
-	}
+	var raw []byte
+	var zipPath string
+	if req.ImageURL != "" {
+		raw, err = fetchAllowedRemoteImage(req.ImageURL)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to fetch remote cover: %v", err), http.StatusUnprocessableEntity)
+			return
+		}
+	} else {
+		zipPath, err = decodeCoverKey(req.Key)
+		if err != nil {
+			http.Error(w, "Invalid cover key", http.StatusBadRequest)
+			return
+		}
 
-	raw, _, err := scanner.ReadCoverOption(bookPath, zipPath)
-	if err != nil {
-		http.Error(w, "Cover candidate not found", http.StatusNotFound)
-		return
+		raw, _, err = scanner.ReadCoverOption(bookPath, zipPath)
+		if err != nil {
+			http.Error(w, "Cover candidate not found", http.StatusNotFound)
+			return
+		}
 	}
 
 	cacheJPG, err := scanner.ConvertImageToJPEG(raw)
@@ -1491,9 +1662,16 @@ func (s *Server) HandleUpdateCover(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.WriteToEPUB {
-		if err := scanner.WriteCoverToEPUB(bookPath, zipPath); err != nil {
-			http.Error(w, fmt.Sprintf("Failed writing cover to EPUB: %v", err), http.StatusUnprocessableEntity)
-			return
+		if req.ImageURL != "" {
+			if err := scanner.WriteCoverBytesToEPUB(bookPath, cacheJPG); err != nil {
+				http.Error(w, fmt.Sprintf("Failed writing remote cover to EPUB: %v", err), http.StatusUnprocessableEntity)
+				return
+			}
+		} else {
+			if err := scanner.WriteCoverToEPUB(bookPath, zipPath); err != nil {
+				http.Error(w, fmt.Sprintf("Failed writing cover to EPUB: %v", err), http.StatusUnprocessableEntity)
+				return
+			}
 		}
 		localCoverPath := filepath.Join(filepath.Dir(bookPath), "cover.jpg")
 		if err := os.WriteFile(localCoverPath, cacheJPG, 0644); err != nil {
@@ -1610,6 +1788,386 @@ func decodeCoverKey(key string) (string, error) {
 		return "", fmt.Errorf("empty cover key")
 	}
 	return p, nil
+}
+
+type wikiOpenSearchResponse []any
+
+type wikiSummaryResponse struct {
+	Title     string `json:"title"`
+	Thumbnail *struct {
+		Source string `json:"source"`
+	} `json:"thumbnail"`
+	OriginalImage *struct {
+		Source string `json:"source"`
+	} `json:"originalimage"`
+}
+
+func fetchWikipediaCoverCandidates(client *http.Client, query string, limit int) ([]coverCandidate, error) {
+	if limit <= 0 {
+		limit = 6
+	}
+	opensearchURL := "https://en.wikipedia.org/w/api.php?action=opensearch&format=json&namespace=0&limit=" + strconv.Itoa(limit) + "&search=" + url.QueryEscape(query)
+	var raw wikiOpenSearchResponse
+	if err := fetchJSON(client, opensearchURL, &raw); err != nil {
+		return nil, err
+	}
+	if len(raw) < 2 {
+		return nil, nil
+	}
+
+	titlesAny, ok := raw[1].([]any)
+	if !ok {
+		return nil, nil
+	}
+
+	out := make([]coverCandidate, 0, len(titlesAny))
+	seen := map[string]struct{}{}
+	for _, v := range titlesAny {
+		title, ok := v.(string)
+		if !ok {
+			continue
+		}
+		title = strings.TrimSpace(title)
+		if title == "" {
+			continue
+		}
+
+		summaryURL := "https://en.wikipedia.org/api/rest_v1/page/summary/" + url.PathEscape(title)
+		var summary wikiSummaryResponse
+		if err := fetchJSON(client, summaryURL, &summary); err != nil {
+			continue
+		}
+
+		imageURL := ""
+		if summary.OriginalImage != nil {
+			imageURL = strings.TrimSpace(summary.OriginalImage.Source)
+		}
+		if imageURL == "" && summary.Thumbnail != nil {
+			imageURL = strings.TrimSpace(summary.Thumbnail.Source)
+		}
+		if imageURL == "" {
+			continue
+		}
+		if !isAllowedRemoteCoverURL(imageURL) {
+			continue
+		}
+		if _, ok := seen[imageURL]; ok {
+			continue
+		}
+		seen[imageURL] = struct{}{}
+		out = append(out, makeRemoteCoverCandidate(imageURL, firstNonEmpty([]string{summary.Title, title}), "wikipedia"))
+	}
+	return out, nil
+}
+
+func makeRemoteCoverCandidate(imageURL, name, source string) coverCandidate {
+	return coverCandidate{
+		Key:        "remote:" + encodeCoverKey(imageURL),
+		Name:       strings.TrimSpace(name),
+		MediaType:  mediaTypeFromURL(imageURL),
+		Width:      0,
+		Height:     0,
+		IsCurrent:  false,
+		PreviewURL: imageURL,
+		Source:     source,
+		Remote:     true,
+		ImageURL:   imageURL,
+	}
+}
+
+func fetchGoogleBookCoverCandidates(client *http.Client, query string, isbn string, limit int) ([]coverCandidate, error) {
+	if limit <= 0 {
+		limit = 6
+	}
+	queries := make([]string, 0, 2)
+	if strings.TrimSpace(isbn) != "" {
+		queries = append(queries, "isbn:"+normalizeISBN(isbn))
+	}
+	if strings.TrimSpace(query) != "" {
+		queries = append(queries, strings.TrimSpace(query))
+	}
+
+	out := make([]coverCandidate, 0, limit)
+	seen := map[string]struct{}{}
+
+	for _, q := range queries {
+		googleURL := "https://www.googleapis.com/books/v1/volumes?maxResults=" + strconv.Itoa(limit) + "&q=" + url.QueryEscape(q)
+		var decoded googleBooksResponse
+		if err := fetchJSON(client, googleURL, &decoded); err != nil {
+			continue
+		}
+
+		for _, item := range decoded.Items {
+			imageURL := pickFirstNonEmpty(
+				item.VolumeInfo.ImageLinks.ExtraLarge,
+				item.VolumeInfo.ImageLinks.Large,
+				item.VolumeInfo.ImageLinks.Medium,
+				item.VolumeInfo.ImageLinks.Small,
+				item.VolumeInfo.ImageLinks.Thumbnail,
+				item.VolumeInfo.ImageLinks.SmallThumbnail,
+			)
+			imageURL = strings.TrimSpace(imageURL)
+			if imageURL == "" {
+				continue
+			}
+			imageURL = normalizeGoogleBooksImageURL(imageURL)
+			if !isAllowedRemoteCoverURL(imageURL) {
+				continue
+			}
+			if _, ok := seen[imageURL]; ok {
+				continue
+			}
+			seen[imageURL] = struct{}{}
+
+			name := firstNonEmpty([]string{item.VolumeInfo.Title, "Google Books"})
+			out = append(out, makeRemoteCoverCandidate(imageURL, name, "googlebooks"))
+		}
+	}
+
+	return out, nil
+}
+
+func fetchOpenLibrarySearchCoverCandidates(client *http.Client, query string, limit int) ([]coverCandidate, error) {
+	if limit <= 0 {
+		limit = 8
+	}
+	openLibraryURL := "https://openlibrary.org/search.json?limit=" + strconv.Itoa(limit) + "&q=" + url.QueryEscape(query)
+	var decoded openLibrarySearchResponse
+	if err := fetchJSON(client, openLibraryURL, &decoded); err != nil {
+		return nil, err
+	}
+
+	out := make([]coverCandidate, 0, len(decoded.Docs))
+	seen := map[string]struct{}{}
+	for _, d := range decoded.Docs {
+		if d.CoverI <= 0 {
+			continue
+		}
+		imageURL := fmt.Sprintf("https://covers.openlibrary.org/b/id/%d-L.jpg?default=false", d.CoverI)
+		if !isAllowedRemoteCoverURL(imageURL) {
+			continue
+		}
+		if _, ok := seen[imageURL]; ok {
+			continue
+		}
+		seen[imageURL] = struct{}{}
+		name := firstNonEmpty([]string{d.Title, "Open Library"})
+		out = append(out, makeRemoteCoverCandidate(imageURL, name, "openlibrary"))
+	}
+	return out, nil
+}
+
+func normalizeGoogleBooksImageURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return raw
+	}
+	if u.Scheme == "" {
+		u.Scheme = "https"
+	}
+	if strings.EqualFold(u.Scheme, "http") {
+		u.Scheme = "https"
+	}
+	q := u.Query()
+	q.Del("edge")
+	q.Set("img", "1")
+	if q.Get("zoom") == "" {
+		q.Set("zoom", "2")
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func pickFirstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func mediaTypeFromURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "image/jpeg"
+	}
+	p := strings.ToLower(u.Path)
+	if strings.HasSuffix(p, ".png") {
+		return "image/png"
+	}
+	return "image/jpeg"
+}
+
+func isAllowedRemoteCoverURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	if host == "" {
+		return false
+	}
+	allowed := []string{
+		"covers.openlibrary.org",
+		"books.google.com",
+		"books.googleusercontent.com",
+		"lh3.googleusercontent.com",
+		"upload.wikimedia.org",
+		"wikipedia.org",
+		"en.wikipedia.org",
+	}
+	for _, a := range allowed {
+		if host == a || strings.HasSuffix(host, "."+a) {
+			return true
+		}
+	}
+	return false
+}
+
+func remoteImageReachable(client *http.Client, raw string) bool {
+	if !isAllowedRemoteCoverURL(raw) {
+		return false
+	}
+	req, err := http.NewRequest(http.MethodHead, raw, nil)
+	if err != nil {
+		return false
+	}
+	applyOutboundHeaders(req)
+	res, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer res.Body.Close()
+	return res.StatusCode >= 200 && res.StatusCode < 300
+}
+
+func fetchAllowedRemoteImage(raw string) ([]byte, error) {
+	if !isAllowedRemoteCoverURL(raw) {
+		return nil, fmt.Errorf("remote URL host is not allowed")
+	}
+	client := &http.Client{Timeout: 20 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, raw, nil)
+	if err != nil {
+		return nil, err
+	}
+	applyOutboundHeaders(req)
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return nil, fmt.Errorf("unexpected status: %d", res.StatusCode)
+	}
+	const maxBytes = 10 << 20 // 10MB
+	limited := io.LimitReader(res.Body, maxBytes+1)
+	b, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxBytes {
+		return nil, fmt.Errorf("remote image too large")
+	}
+	return b, nil
+}
+
+func rankAndFilterOnlineCovers(client *http.Client, in []coverCandidate) []coverCandidate {
+	minW := envIntDefault("ONLINE_COVER_MIN_WIDTH", 300)
+	minH := envIntDefault("ONLINE_COVER_MIN_HEIGHT", 420)
+
+	out := make([]coverCandidate, 0, len(in))
+	for _, c := range in {
+		if !c.Remote {
+			out = append(out, c)
+			continue
+		}
+
+		w, h, ok := probeRemoteImageDimensions(client, c.ImageURL)
+		if ok {
+			c.Width = w
+			c.Height = h
+		}
+		if c.Width > 0 && c.Height > 0 && (c.Width < minW || c.Height < minH) {
+			continue
+		}
+		out = append(out, c)
+	}
+
+	sort.SliceStable(out, func(i, j int) bool {
+		a := out[i]
+		b := out[j]
+
+		ar := sourcePriorityRank(a.Source)
+		br := sourcePriorityRank(b.Source)
+		if ar != br {
+			return ar < br
+		}
+
+		aa := a.Width * a.Height
+		ba := b.Width * b.Height
+		if aa != ba {
+			return aa > ba
+		}
+		return strings.ToLower(a.Name) < strings.ToLower(b.Name)
+	})
+
+	return out
+}
+
+func sourcePriorityRank(source string) int {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "googlebooks":
+		return 1
+	case "openlibrary":
+		return 2
+	case "wikipedia":
+		return 3
+	default:
+		return 9
+	}
+}
+
+func probeRemoteImageDimensions(client *http.Client, raw string) (int, int, bool) {
+	if !isAllowedRemoteCoverURL(raw) {
+		return 0, 0, false
+	}
+	req, err := http.NewRequest(http.MethodGet, raw, nil)
+	if err != nil {
+		return 0, 0, false
+	}
+	applyOutboundHeaders(req)
+	res, err := client.Do(req)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return 0, 0, false
+	}
+
+	const sniffLimit = 5 << 20 // 5MB cap for probing dimensions
+	b, err := io.ReadAll(io.LimitReader(res.Body, sniffLimit))
+	if err != nil {
+		return 0, 0, false
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(b))
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+		return 0, 0, false
+	}
+	return cfg.Width, cfg.Height, true
+}
+
+func envIntDefault(name string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return fallback
+	}
+	return v
 }
 
 func (s *Server) runScanJob(operation string) {

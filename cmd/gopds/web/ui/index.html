@@ -25,6 +25,17 @@
                 <button id="auth-btn" class="auth-button" type="button">Admin Login</button>
             </div>
         </div>
+        <div class="browse-row">
+            <select id="author-filter" aria-label="Filter by author">
+                <option value="__all">All authors</option>
+            </select>
+            <select id="category-filter" aria-label="Filter by category">
+                <option value="__all">All categories</option>
+            </select>
+            <select id="subcategory-filter" aria-label="Filter by sub-category">
+                <option value="__all">All sub-categories</option>
+            </select>
+        </div>
         <div id="auth-status" class="auth-status" aria-live="polite"></div>
         <div id="rebuild-status" class="rebuild-status" aria-live="polite"></div>
     </div>

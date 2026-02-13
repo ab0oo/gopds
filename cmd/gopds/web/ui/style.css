@@ -58,6 +58,22 @@ button {
     outline: none;
 }
 
+.browse-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 10px;
+    margin-top: 10px;
+}
+
+.browse-row select {
+    width: 100%;
+    padding: 10px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: #111820;
+    color: var(--text-main);
+}
+
 .icon-button {
     width: 42px;
     height: 42px;
@@ -356,6 +372,19 @@ button {
     margin-bottom: 10px;
 }
 
+.cover-online-actions {
+    margin-bottom: 10px;
+}
+
+#cover-fetch-online {
+    border-radius: 9px;
+    border: 1px solid var(--border);
+    background: #1c2e43;
+    color: var(--text-main);
+    padding: 8px 10px;
+    cursor: pointer;
+}
+
 .cover-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
@@ -427,6 +456,10 @@ button {
 
     .controls-row {
         grid-template-columns: 1fr auto;
+    }
+
+    .browse-row {
+        grid-template-columns: 1fr;
     }
 
     .ol-controls {
