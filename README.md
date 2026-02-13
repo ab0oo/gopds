@@ -1,5 +1,8 @@
 # GoPDS
 
+Obligatory screenshot for the reddit trolls:
+<img width="1387" height="1162" alt="image" src="https://github.com/user-attachments/assets/a669e9cd-6161-46a5-955a-a2ab68944b17" />
+
 GoPDS is a lightweight OPDS server for EPUB libraries, with a web UI for live metadata and cover editing.
 
 ## Current Capabilities
