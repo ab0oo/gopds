@@ -1,68 +1,146 @@
-# GoPDS 📚
+# GoPDS
 
-A high-performance, lightweight OPDS catalog server written in Go. Designed specifically for NAS environments and large libraries (2,000+ books).
+GoPDS is a lightweight OPDS server for EPUB libraries, with a web UI for live metadata and cover editing.
 
-## Features
+## Current Capabilities
 
-* **Blistering Fast:** Scans 2,500+ books in under a minute.
-* **Automatic Metadata:** Extracts titles, authors, and descriptions directly from EPUB files.
-* **Aggressive Cover Extraction:** Multi-strategy logic to find and serve book covers.
-* **Docker Ready:** Tiny footprint (~20MB container) with graceful shutdown support.
-* **Standard Compliant:** Works with Moon+ Reader, KyBook, Aldiko, and more.
+- OPDS catalog serving with large-library navigation:
+  - Root OPDS navigation feed at `/opds`
+  - Author-range browsing (`authors=a`, `authors=a-d`) with pagination
+  - Category/subcategory browsing at `/opds/categories` (optional path-derived indexing)
+- Public book access:
+  - OPDS feeds
+  - JSON list (`/api/books`)
+  - Book downloads (`/download/{id}`)
+- Authenticated admin editing:
+  - Live EPUB metadata edit/write
+  - Open Library + Google Books compare/apply workflow
+  - Cover candidate selection and apply
+  - Optional write selected cover into EPUB (`write_to_epub`)
+  - Rebuild/rescan controls
+- Cover behavior:
+  - Cache cover writes to `data/covers/{id}.jpg`
+  - When writing to EPUB, also writes sibling `cover.jpg` next to the EPUB file
+  - EPUB cover normalization prefers canonical `cover.jpg`
+- Scanner modes:
+  - Incremental rescan (changed/new books only)
+  - Full rebuild (drop DB cache + clear cover cache + full reindex)
 
-## Quick Start (Docker Compose)
+## Configuration
 
-The easiest way to run GoPDS is with Docker.
+Environment variables:
+
+- `BOOK_PATH` (default `./books`): Root of EPUB library.
+- `DB_PATH` (currently initialized in app as `./data/gopds.db`): SQLite cache location.
+- `ADMIN_USERNAME` (default `admin`): Admin username.
+- `ADMIN_PASSWORD` (required for authenticated features): Admin password.
+- `CATEGORY_FROM_PATH` (default disabled): If `true/1/yes/on`, category/subcategory are inferred from directory layout:
+  - category = first folder under `BOOK_PATH`
+  - subcategory = second folder under `BOOK_PATH` (optional)
+
+Example `docker-compose.yaml`:
 
 ```yaml
 services:
   gopds:
-    build: .
+    image: ghcr.io/ab0oo/gopds:latest
     container_name: gopds
     ports:
       - "8880:8880"
-    volumes:
-      - /path/to/your/books:/root/books:ro
-      - ./data:/root/data
     environment:
-      - BOOK_PATH=/root/books
+      - BOOK_PATH=/app/books
+      - DB_PATH=/app/data/gopds.db
+      - CATEGORY_FROM_PATH=true
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=change-this-password
+    volumes:
+      - /path/to/books:/app/books
+      - /path/to/gopds-data:/app/data
     restart: unless-stopped
 ```
 
-Setup & Configuration
+Important:
 
-    Clone the repo: git clone https://github.com/ab0oo/gopds.git
+- If you want EPUB metadata/cover writes, the books volume must be writable.
+- If `ADMIN_PASSWORD` is empty, admin-protected editing features are unavailable.
 
-    Build the container: docker compose up -d --build
+## OPDS Endpoints
 
-    Connect your Reader:
+- `GET /opds`
+  - OPDS root navigation feed.
+- `GET /opds?authors=a`
+- `GET /opds?authors=a-d&page=1&limit=100`
+  - Author-range acquisition feeds (paginated).
+- `GET /opds/categories`
+- `GET /opds/categories?category=Fiction`
+- `GET /opds/categories?category=Fiction&subcategory=SciFi&page=1&limit=100`
+  - Category/subcategory navigation + acquisition feeds.
 
-        Open your favorite OPDS app.
+## Public vs Authenticated API
 
-        Add a new catalog URL: http://[NAS-IP]:8880/opds
+Public:
 
-Development
-Prerequisites
+- `GET /opds`
+- `GET /opds/authors`
+- `GET /opds/categories`
+- `GET /api/books`
+- `GET /covers/{id}.jpg`
+- `GET /download/{id}`
+- `GET /api/openlibrary/search`
 
-    Go 1.24+
+Auth/session:
 
-    SQLite3 (CGO enabled)
+- `GET /api/auth/status`
+- `POST /api/auth/login`
+- `POST /api/auth/logout`
 
-Local Build
-Bash
+Admin-protected:
 
+- `GET /api/books/{id}/metadata/live`
+- `PUT /api/books/{id}/metadata`
+- `GET /api/books/{id}/covers/candidates`
+- `GET /api/books/{id}/covers/candidates/{key}`
+- `PUT /api/books/{id}/cover`
+- `POST /api/admin/rescan`
+- `POST /api/admin/rebuild`
+- `GET /api/admin/rebuild/status`
+
+## UI Notes
+
+- Browser UI is at `/`.
+- Admin login is required to see and use:
+  - `Edit Metadata`
+  - `Change Cover`
+  - `Rescan/Rebuild` controls
+- OPDS clients can use `/opds` (or root with OPDS accept headers).
+
+## Build and Run Locally
+
+```bash
 go mod tidy
 go build -o gopds ./cmd/gopds
 ./gopds
+```
 
-Project Structure
+Then open:
 
-    cmd/gopds: Entry point and server initialization.
+- Web UI: `http://localhost:8880/`
+- OPDS: `http://localhost:8880/opds`
 
-    internal/scanner: EPUB parsing and cover extraction logic.
+## CI/CD
 
-    internal/database: SQLite persistence layer.
+GitHub Actions workflow:
 
-    internal/web: Chi-based router and OPDS XML generation.
+- `.github/workflows/docker-build.yml`
+- Builds Docker image on push/PR/manual
+- Publishes to GHCR on non-PR events:
+  - `ghcr.io/<owner>/<repo>:latest` (default branch)
+  - ref/tag/sha tags
+- Uploads a compressed Docker image tarball artifact for each run
 
-Built with ❤️ by ab0oo
+## Security Recommendations
+
+- Use a strong `ADMIN_PASSWORD`.
+- Run behind HTTPS reverse proxy for internet exposure.
+- Protect `main` with required signed commits.
+- Keep GHCR package visibility intentional (public/private).

@@ -1,15 +1,18 @@
 services:
   gopds:
-    image: gopds-local
+    build: .
+#    image: gopds-local
     container_name: gopds
-    user: "10000:10000" # Use your actual host UID:GID
+    user: "998:998" # Use your actual host UID:GID, this needs to be the owner of the book library for writes
     ports:
       - "8880:8880"
     environment:
       - BOOK_PATH=/app/books
       - DB_PATH=/app/data/gopds.db
+      - CATEGORY_SOURCE=subject
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=battery-correct-pony-stapler
     volumes:
-      # [Host Path] : [Container Path (matching the ENV above)]
-      - /share/Multimedia/books:/app/books:ro  # Read-only is safer for your books!
-      - ./data:/app/data                        # Read-write for DB and covers
+      - /share/Multimedia/books:/app/books       # Read-write if you want to use the GUI for metadata changes
+      - /share/Multimedia/config/gopds:/app/data # Read-write for DB and covers
     restart: unless-stopped
