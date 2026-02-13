@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"image"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"io/fs"
 	"log"
@@ -66,6 +69,15 @@ type MetadataUpdate struct {
 	Subjects    []string
 	Series      string
 	SeriesIndex string
+}
+
+type CoverOption struct {
+	ZipPath   string `json:"zip_path"`
+	Name      string `json:"name"`
+	MediaType string `json:"media_type"`
+	Width     int    `json:"width"`
+	Height    int    `json:"height"`
+	IsCurrent bool   `json:"is_current"`
 }
 
 var (
@@ -318,7 +330,8 @@ func rewriteOPFMetadata(opfContent []byte, update MetadataUpdate) ([]byte, error
 }
 
 func metadataInnerBlock(content []byte) ([]byte, int, int, error) {
-	re := regexp.MustCompile(`(?is)<metadata\b[^>]*>(.*?)</metadata>`)
+	// Some EPUBs namespace OPF tags (e.g. <opf:metadata>...</opf:metadata>).
+	re := regexp.MustCompile(`(?is)<(?:[a-zA-Z_][\w.-]*:)?metadata\b[^>]*>(.*?)</(?:[a-zA-Z_][\w.-]*:)?metadata>`)
 	idx := re.FindSubmatchIndex(content)
 	if idx == nil || len(idx) < 4 {
 		return nil, 0, 0, errMetadataTagNotFound
@@ -407,7 +420,7 @@ func extractPreferredIdentifier(metadata []byte) string {
 }
 
 func extractMetaContentByName(metadata []byte, name string) string {
-	re := regexp.MustCompile(`(?is)<meta\b([^>]*)/?>`)
+	re := regexp.MustCompile(`(?is)<(?:[a-zA-Z_][\w.-]*:)?meta\b([^>]*)/?>`)
 	matches := re.FindAllSubmatch(metadata, -1)
 	for _, m := range matches {
 		if len(m) < 2 {
@@ -530,8 +543,8 @@ func setMultiTag(metadata []byte, tag string, values []string, changed bool) ([]
 
 func setMetaNameContent(metadata []byte, name, value string, changed bool) ([]byte, bool) {
 	value = strings.TrimSpace(value)
-	doubleQuoted := regexp.MustCompile(`(?is)<meta\b[^>]*name\s*=\s*"` + regexp.QuoteMeta(name) + `"[^>]*/?>`)
-	singleQuoted := regexp.MustCompile(`(?is)<meta\b[^>]*name\s*=\s*'` + regexp.QuoteMeta(name) + `'[^>]*/?>`)
+	doubleQuoted := regexp.MustCompile(`(?is)<(?:[a-zA-Z_][\w.-]*:)?meta\b[^>]*name\s*=\s*"` + regexp.QuoteMeta(name) + `"[^>]*/?>`)
+	singleQuoted := regexp.MustCompile(`(?is)<(?:[a-zA-Z_][\w.-]*:)?meta\b[^>]*name\s*=\s*'` + regexp.QuoteMeta(name) + `'[^>]*/?>`)
 	if doubleQuoted.Match(metadata) {
 		metadata = doubleQuoted.ReplaceAll(metadata, []byte(""))
 		changed = true
@@ -575,6 +588,7 @@ func (s *Scanner) Start(root string) error {
 
 	log.Printf("🚀 Starting scan of %s (resolved to: %s)...", root, realPath)
 	start := time.Now()
+	usePathCategories := isPathCategoryEnabled()
 
 	stats := struct {
 		Total     int
@@ -582,6 +596,12 @@ func (s *Scanner) Start(root string) error {
 		NoMeta    int
 		NoCover   int
 	}{}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 
 	err = filepath.WalkDir(realPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(strings.ToLower(d.Name()), ".epub") {
@@ -613,8 +633,11 @@ func (s *Scanner) Start(root string) error {
 			Description: meta.Description,
 			ModTime:     info.ModTime(),
 		}
+		if usePathCategories {
+			book.Category, book.Subcategory = categoriesFromPath(realPath, path)
+		}
 
-		id, err := s.db.SaveBook(book)
+		id, err := s.db.SaveBookTx(tx, book)
 		if err != nil {
 			log.Printf("❌ Error saving book to DB: %v", err)
 			return nil
@@ -626,6 +649,13 @@ func (s *Scanner) Start(root string) error {
 
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
 
 	elapsed := time.Since(start)
 	log.Printf("\n--- 🏁 Scan Complete (%v) ---", elapsed)
@@ -635,7 +665,35 @@ func (s *Scanner) Start(root string) error {
 	log.Printf("Missing Covers:     %d", stats.NoCover)
 	log.Printf("-------------------------------\n")
 
-	return err
+	return nil
+}
+
+func isPathCategoryEnabled() bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("CATEGORY_FROM_PATH")))
+	return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+}
+
+func categoriesFromPath(root, bookPath string) (string, string) {
+	root = filepath.Clean(root)
+	bookPath = filepath.Clean(bookPath)
+	rel, err := filepath.Rel(root, bookPath)
+	if err != nil {
+		return "", ""
+	}
+	dir := filepath.Dir(rel)
+	if dir == "." || dir == string(filepath.Separator) {
+		return "", ""
+	}
+	parts := strings.Split(filepath.ToSlash(dir), "/")
+	if len(parts) == 0 {
+		return "", ""
+	}
+	category := strings.TrimSpace(parts[0])
+	subcategory := ""
+	if len(parts) > 1 {
+		subcategory = strings.TrimSpace(parts[1])
+	}
+	return category, subcategory
 }
 
 func SaveCover(epubPath string, bookID int) error {
@@ -649,6 +707,12 @@ func SaveCover(epubPath string, bookID int) error {
 		return err
 	}
 	defer reader.Close()
+
+	for _, f := range reader.File {
+		if isPreferredCoverFilename(f.Name) {
+			return extractZipFile(f, bookID)
+		}
+	}
 
 	for _, f := range reader.File {
 		low := strings.ToLower(f.Name)
@@ -709,6 +773,494 @@ func SaveCover(epubPath string, bookID int) error {
 	}
 
 	return fmt.Errorf("no cover found for %s", epubPath)
+}
+
+func ListCoverOptions(epubPath string) ([]CoverOption, error) {
+	reader, err := zip.OpenReader(epubPath)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	opfPath, err := findOPFPath(reader.File)
+	if err != nil {
+		return nil, err
+	}
+	if opfPath == "" {
+		return nil, fmt.Errorf("opf package document not found")
+	}
+
+	opfContent, err := readZipEntry(reader.File, opfPath)
+	if err != nil {
+		return nil, err
+	}
+	var opf OPF
+	if err := xml.Unmarshal(opfContent, &opf); err != nil {
+		return nil, err
+	}
+
+	opfDir := filepath.Dir(opfPath)
+	currentCoverPath := detectCurrentCoverZipPath(opf, opfDir)
+
+	all := make([]CoverOption, 0, 12)
+	suitable := make([]CoverOption, 0, 8)
+
+	for _, item := range opf.Manifest {
+		mt := strings.ToLower(strings.TrimSpace(item.MediaType))
+		if mt != "image/jpeg" && mt != "image/jpg" && mt != "image/png" {
+			continue
+		}
+		zipPath := normalizeZipPath(filepath.Join(opfDir, item.Href))
+		if zipPath == "" {
+			continue
+		}
+
+		raw, err := readZipEntry(reader.File, zipPath)
+		if err != nil {
+			continue
+		}
+
+		cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+		if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+			continue
+		}
+
+		opt := CoverOption{
+			ZipPath:   zipPath,
+			Name:      filepath.Base(zipPath),
+			MediaType: mt,
+			Width:     cfg.Width,
+			Height:    cfg.Height,
+			IsCurrent: zipPath == currentCoverPath,
+		}
+		all = append(all, opt)
+		if isSuitableCoverDimension(cfg.Width, cfg.Height) {
+			suitable = append(suitable, opt)
+		}
+	}
+
+	if len(suitable) > 0 {
+		return suitable, nil
+	}
+	return all, nil
+}
+
+func ReadCoverOption(epubPath, zipPath string) ([]byte, string, error) {
+	reader, err := zip.OpenReader(epubPath)
+	if err != nil {
+		return nil, "", err
+	}
+	defer reader.Close()
+
+	normalized := normalizeZipPath(zipPath)
+	if normalized == "" {
+		return nil, "", fmt.Errorf("invalid cover path")
+	}
+
+	for _, f := range reader.File {
+		if normalizeZipPath(f.Name) != normalized {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return nil, "", err
+		}
+		defer rc.Close()
+		b, err := io.ReadAll(rc)
+		if err != nil {
+			return nil, "", err
+		}
+		return b, mediaTypeFromPath(f.Name), nil
+	}
+
+	return nil, "", os.ErrNotExist
+}
+
+func WriteCoverToEPUB(epubPath, selectedZipPath string) error {
+	reader, err := zip.OpenReader(epubPath)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	opfPath, err := findOPFPath(reader.File)
+	if err != nil {
+		return err
+	}
+	if opfPath == "" {
+		return fmt.Errorf("opf package document not found")
+	}
+	opfContent, err := readZipEntry(reader.File, opfPath)
+	if err != nil {
+		return err
+	}
+	var opf OPF
+	if err := xml.Unmarshal(opfContent, &opf); err != nil {
+		return err
+	}
+	opfDir := filepath.Dir(opfPath)
+	canonicalCoverPath := normalizeZipPath(filepath.Join(opfDir, "cover.jpg"))
+	canonicalHref := relativeHrefFromOPFDir(opfDir, canonicalCoverPath)
+	updatedOPF, err := rewriteOPFCoverReference(opfContent, canonicalHref)
+	if err != nil {
+		return err
+	}
+
+	selectedRaw, err := readZipEntry(reader.File, normalizeZipPath(selectedZipPath))
+	if err != nil {
+		return err
+	}
+
+	img, _, err := image.Decode(bytes.NewReader(selectedRaw))
+	if err != nil {
+		return fmt.Errorf("selected cover decode failed: %w", err)
+	}
+
+	rewritten, err := encodeImageForMediaType(img, "image/jpeg", canonicalCoverPath)
+	if err != nil {
+		return err
+	}
+
+	tempFile, err := os.CreateTemp(filepath.Dir(epubPath), ".gopds-cover-*.epub")
+	if err != nil {
+		return err
+	}
+	tempPath := tempFile.Name()
+	cleanupTemp := true
+	defer func() {
+		_ = tempFile.Close()
+		if cleanupTemp {
+			_ = os.Remove(tempPath)
+		}
+	}()
+
+	writer := zip.NewWriter(tempFile)
+	removePaths := collectExistingCoverPaths(opf, opfDir)
+	delete(removePaths, canonicalCoverPath)
+
+	wroteCover := false
+	wroteOPF := false
+	for _, f := range reader.File {
+		normalized := normalizeZipPath(f.Name)
+
+		if normalized == normalizeZipPath(opfPath) {
+			h := f.FileHeader
+			dst, err := writer.CreateHeader(&h)
+			if err != nil {
+				_ = writer.Close()
+				return err
+			}
+			if _, err := dst.Write(updatedOPF); err != nil {
+				_ = writer.Close()
+				return err
+			}
+			wroteOPF = true
+			continue
+		}
+
+		if normalized == canonicalCoverPath {
+			h := f.FileHeader
+			dst, err := writer.CreateHeader(&h)
+			if err != nil {
+				_ = writer.Close()
+				return err
+			}
+			if _, err := dst.Write(rewritten); err != nil {
+				_ = writer.Close()
+				return err
+			}
+			wroteCover = true
+			continue
+		}
+
+		if _, drop := removePaths[normalized]; drop {
+			continue
+		}
+
+		h := f.FileHeader
+		dst, err := writer.CreateHeader(&h)
+		if err != nil {
+			_ = writer.Close()
+			return err
+		}
+		src, err := f.Open()
+		if err != nil {
+			_ = writer.Close()
+			return err
+		}
+		if _, err := io.Copy(dst, src); err != nil {
+			src.Close()
+			_ = writer.Close()
+			return err
+		}
+		src.Close()
+	}
+
+	if !wroteOPF {
+		_ = writer.Close()
+		return fmt.Errorf("opf package document missing during rewrite")
+	}
+	if !wroteCover {
+		dst, err := writer.Create(canonicalCoverPath)
+		if err != nil {
+			_ = writer.Close()
+			return err
+		}
+		if _, err := dst.Write(rewritten); err != nil {
+			_ = writer.Close()
+			return err
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		return err
+	}
+	if err := tempFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, epubPath); err != nil {
+		return err
+	}
+	cleanupTemp = false
+	return nil
+}
+
+func ConvertImageToJPEG(raw []byte) ([]byte, error) {
+	img, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	if err := jpeg.Encode(&out, img, &jpeg.Options{Quality: 90}); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+func isSuitableCoverDimension(width, height int) bool {
+	if width < 240 || height < 320 {
+		return false
+	}
+	ratio := float64(width) / float64(height)
+	return ratio >= 0.55 && ratio <= 0.85
+}
+
+func detectCurrentCoverZipPath(opf OPF, opfDir string) string {
+	for _, item := range opf.Manifest {
+		p := normalizeZipPath(filepath.Join(opfDir, item.Href))
+		if isPreferredCoverFilename(p) {
+			return p
+		}
+	}
+
+	for _, item := range opf.Manifest {
+		if strings.Contains(strings.ToLower(item.Properties), "cover-image") {
+			return normalizeZipPath(filepath.Join(opfDir, item.Href))
+		}
+	}
+
+	var coverID string
+	for _, m := range opf.Meta {
+		if strings.EqualFold(strings.TrimSpace(m.Name), "cover") {
+			coverID = strings.TrimSpace(m.Content)
+			break
+		}
+	}
+	if coverID != "" {
+		for _, item := range opf.Manifest {
+			if strings.TrimSpace(item.ID) == coverID {
+				return normalizeZipPath(filepath.Join(opfDir, item.Href))
+			}
+		}
+	}
+	return ""
+}
+
+func resolveWritableCoverTarget(opf OPF, opfDir string) (string, string) {
+	for _, item := range opf.Manifest {
+		p := normalizeZipPath(filepath.Join(opfDir, item.Href))
+		if !isPreferredCoverFilename(p) {
+			continue
+		}
+		mt := strings.ToLower(strings.TrimSpace(item.MediaType))
+		if mt == "" {
+			mt = mediaTypeFromPath(p)
+		}
+		return p, mt
+	}
+
+	current := detectCurrentCoverZipPath(opf, opfDir)
+	if current != "" {
+		for _, item := range opf.Manifest {
+			p := normalizeZipPath(filepath.Join(opfDir, item.Href))
+			if p == current {
+				return current, strings.ToLower(strings.TrimSpace(item.MediaType))
+			}
+		}
+		return current, mediaTypeFromPath(current)
+	}
+
+	for _, item := range opf.Manifest {
+		mt := strings.ToLower(strings.TrimSpace(item.MediaType))
+		if mt == "image/jpeg" || mt == "image/jpg" || mt == "image/png" {
+			return normalizeZipPath(filepath.Join(opfDir, item.Href)), mt
+		}
+	}
+	return "", ""
+}
+
+func collectExistingCoverPaths(opf OPF, opfDir string) map[string]struct{} {
+	out := map[string]struct{}{}
+
+	for _, item := range opf.Manifest {
+		p := normalizeZipPath(filepath.Join(opfDir, item.Href))
+		if p == "" {
+			continue
+		}
+		lprops := strings.ToLower(strings.TrimSpace(item.Properties))
+		if strings.Contains(lprops, "cover-image") || isPreferredCoverFilename(p) {
+			out[p] = struct{}{}
+		}
+	}
+
+	current := detectCurrentCoverZipPath(opf, opfDir)
+	if current != "" {
+		out[current] = struct{}{}
+	}
+
+	return out
+}
+
+func relativeHrefFromOPFDir(opfDir, fullPath string) string {
+	opfDir = normalizeZipPath(opfDir)
+	fullPath = normalizeZipPath(fullPath)
+	if opfDir == "" || opfDir == "." {
+		return fullPath
+	}
+	prefix := opfDir + "/"
+	if strings.HasPrefix(fullPath, prefix) {
+		return strings.TrimPrefix(fullPath, prefix)
+	}
+	return filepath.Base(fullPath)
+}
+
+func rewriteOPFCoverReference(opfContent []byte, canonicalHref string) ([]byte, error) {
+	updated := opfContent
+
+	// Normalize metadata cover marker to a single <meta name="cover" content="cover-image"/>.
+	metaInner, mStart, mEnd, err := metadataInnerBlock(updated)
+	if err != nil {
+		return nil, err
+	}
+	metaTagRe := regexp.MustCompile(`(?is)<(?:[a-zA-Z_][\w.-]*:)?meta\b[^>]*?/?>`)
+	newMeta := metaTagRe.ReplaceAllFunc(metaInner, func(tag []byte) []byte {
+		attrs := string(tag)
+		name := strings.ToLower(strings.TrimSpace(extractAttrValue(attrs, "name")))
+		if name == "cover" {
+			return []byte("")
+		}
+		return tag
+	})
+	newMeta = append(newMeta, []byte(``+"\n"+`<meta name="cover" content="cover-image"/>`)...)
+
+	updated = append(append([]byte{}, updated[:mStart]...), append(newMeta, updated[mEnd:]...)...)
+
+	// Normalize manifest cover marker to a single canonical cover item.
+	manifestRe := regexp.MustCompile(`(?is)<manifest\b[^>]*>(.*?)</manifest>`)
+	manifestIdx := manifestRe.FindSubmatchIndex(updated)
+	if manifestIdx == nil || len(manifestIdx) < 4 {
+		return nil, fmt.Errorf("manifest section not found in OPF")
+	}
+	manifestInner := updated[manifestIdx[2]:manifestIdx[3]]
+
+	itemRe := regexp.MustCompile(`(?is)<(?:[a-zA-Z_][\w.-]*:)?item\b[^>]*?/?>`)
+	kept := itemRe.ReplaceAllFunc(manifestInner, func(tag []byte) []byte {
+		attrs := string(tag)
+		id := strings.ToLower(strings.TrimSpace(extractAttrValue(attrs, "id")))
+		href := strings.TrimSpace(extractAttrValue(attrs, "href"))
+		properties := strings.ToLower(strings.TrimSpace(extractAttrValue(attrs, "properties")))
+		if id == "cover-image" || strings.Contains(properties, "cover-image") || isPreferredCoverFilename(href) {
+			return []byte("")
+		}
+		return tag
+	})
+
+	escapedHref, _ := xmlEscape(canonicalHref)
+	coverItem := []byte(`` + "\n" + `<item id="cover-image" href="` + escapedHref + `" media-type="image/jpeg" properties="cover-image"/>`)
+	newManifestInner := append(kept, coverItem...)
+
+	rebuilt := make([]byte, 0, len(updated)-len(manifestInner)+len(newManifestInner))
+	rebuilt = append(rebuilt, updated[:manifestIdx[2]]...)
+	rebuilt = append(rebuilt, newManifestInner...)
+	rebuilt = append(rebuilt, updated[manifestIdx[3]:]...)
+
+	return rebuilt, nil
+}
+
+func encodeImageForMediaType(img image.Image, mediaType, targetPath string) ([]byte, error) {
+	mt := strings.ToLower(strings.TrimSpace(mediaType))
+	if mt == "" {
+		mt = mediaTypeFromPath(targetPath)
+	}
+	var out bytes.Buffer
+	switch mt {
+	case "image/png":
+		if err := png.Encode(&out, img); err != nil {
+			return nil, err
+		}
+	default:
+		if err := jpeg.Encode(&out, img, &jpeg.Options{Quality: 90}); err != nil {
+			return nil, err
+		}
+	}
+	return out.Bytes(), nil
+}
+
+func mediaTypeFromPath(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".png":
+		return "image/png"
+	default:
+		return "image/jpeg"
+	}
+}
+
+func isPreferredCoverFilename(path string) bool {
+	base := strings.ToLower(strings.TrimSpace(filepath.Base(path)))
+	return base == "cover.jpg" || base == "cover.jpeg" || base == "cover.png"
+}
+
+func readZipEntry(files []*zip.File, path string) ([]byte, error) {
+	target := normalizeZipPath(path)
+	for _, f := range files {
+		if normalizeZipPath(f.Name) != target {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return nil, err
+		}
+		defer rc.Close()
+		b, err := io.ReadAll(rc)
+		if err != nil {
+			return nil, err
+		}
+		return b, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+func normalizeZipPath(path string) string {
+	p := strings.ReplaceAll(path, "\\", "/")
+	p = strings.TrimSpace(p)
+	p = strings.TrimPrefix(p, "./")
+	p = filepath.ToSlash(filepath.Clean(p))
+	p = strings.TrimPrefix(p, "/")
+	if p == "." {
+		return ""
+	}
+	return p
 }
 
 func saveExternalCover(srcPath string, bookID int) error {

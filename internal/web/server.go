@@ -1,8 +1,11 @@
 package web
 
 import (
+	"crypto/rand"
 	"database/sql"
 	"embed"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,8 +16,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ab0oo/gopds/internal/database"
@@ -26,6 +32,46 @@ import (
 type Server struct {
 	db   *database.DB
 	uiFS embed.FS
+
+	rebuildMu    sync.Mutex
+	rebuildState rebuildStatus
+
+	adminUser string
+	adminPass string
+
+	sessionMu sync.Mutex
+	sessions  map[string]authSession
+}
+
+type authSession struct {
+	Username  string
+	ExpiresAt time.Time
+}
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type authStatusPayload struct {
+	Authenticated bool   `json:"authenticated"`
+	Username      string `json:"username,omitempty"`
+}
+
+const (
+	sessionCookieName = "gopds_session"
+	sessionTTL        = 12 * time.Hour
+)
+
+type rebuildStatus struct {
+	Running     bool      `json:"running"`
+	Operation   string    `json:"operation"`
+	Phase       string    `json:"phase"`
+	Message     string    `json:"message"`
+	StartedAt   time.Time `json:"started_at,omitempty"`
+	CompletedAt time.Time `json:"completed_at,omitempty"`
+	Count       int       `json:"count"`
+	Error       string    `json:"error,omitempty"`
 }
 
 type metadataRequest struct {
@@ -60,6 +106,21 @@ type metadataSearchPayload struct {
 	NumFound int                 `json:"num_found"`
 	Query    string              `json:"query"`
 	Results  []metadataCandidate `json:"results"`
+}
+
+type coverCandidate struct {
+	Key        string `json:"key"`
+	Name       string `json:"name"`
+	MediaType  string `json:"media_type"`
+	Width      int    `json:"width"`
+	Height     int    `json:"height"`
+	IsCurrent  bool   `json:"is_current"`
+	PreviewURL string `json:"preview_url"`
+}
+
+type updateCoverRequest struct {
+	Key         string `json:"key"`
+	WriteToEPUB bool   `json:"write_to_epub"`
 }
 
 type openLibrarySearchResponse struct {
@@ -144,7 +205,22 @@ func (f *flexText) UnmarshalJSON(data []byte) error {
 }
 
 func NewServer(db *database.DB, uiFS embed.FS) *Server {
-	return &Server{db: db, uiFS: uiFS}
+	adminUser := strings.TrimSpace(os.Getenv("ADMIN_USERNAME"))
+	if adminUser == "" {
+		adminUser = "admin"
+	}
+	adminPass := os.Getenv("ADMIN_PASSWORD")
+	if strings.TrimSpace(adminPass) == "" {
+		log.Printf("warning: ADMIN_PASSWORD is empty; authenticated features are disabled until it is set")
+	}
+
+	return &Server{
+		db:        db,
+		uiFS:      uiFS,
+		adminUser: adminUser,
+		adminPass: adminPass,
+		sessions:  make(map[string]authSession),
+	}
 }
 
 func (s *Server) Router() http.Handler {
@@ -158,9 +234,22 @@ func (s *Server) Router() http.Handler {
 	}
 
 	r.Get("/opds", s.HandleCatalog)
+	r.Get("/opds/authors", s.HandleAuthorsCatalog)
+	r.Get("/opds/categories", s.HandleCategoriesCatalog)
+	r.Get("/", s.HandleRoot)
+	r.Get("/favicon.ico", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	r.Get("/api/auth/status", s.HandleAuthStatus)
+	r.Post("/api/auth/login", s.HandleAuthLogin)
+	r.Post("/api/auth/logout", s.HandleAuthLogout)
 	r.Get("/api/books", s.HandleBooksJSON)
-	r.Get("/api/books/{id}/metadata/live", s.HandleLiveMetadata)
-	r.Put("/api/books/{id}/metadata", s.HandleUpdateMetadata)
+	r.Get("/api/books/{id}/metadata/live", s.requireAuth(s.HandleLiveMetadata))
+	r.Put("/api/books/{id}/metadata", s.requireAuth(s.HandleUpdateMetadata))
+	r.Get("/api/books/{id}/covers/candidates", s.requireAuth(s.HandleCoverCandidates))
+	r.Get("/api/books/{id}/covers/candidates/{key}", s.requireAuth(s.HandleCoverCandidateImage))
+	r.Put("/api/books/{id}/cover", s.requireAuth(s.HandleUpdateCover))
+	r.Post("/api/admin/rebuild", s.requireAuth(s.HandleRebuildLibrary))
+	r.Post("/api/admin/rescan", s.requireAuth(s.HandleRescanLibrary))
+	r.Get("/api/admin/rebuild/status", s.requireAuth(s.HandleRebuildStatus))
 	r.Get("/api/openlibrary/search", s.HandleOpenLibrarySearch)
 	r.Get("/covers/{id}.jpg", s.HandleCover)
 	r.Get("/download/{id}", s.HandleDownload)
@@ -169,28 +258,526 @@ func (s *Server) Router() http.Handler {
 	return r
 }
 
+type authorRangeBucket struct {
+	Label    string
+	Selector string
+	Start    string
+	End      string
+}
+
+var defaultAuthorBuckets = []authorRangeBucket{
+	{Label: "A-D", Selector: "a-d", Start: "A", End: "D"},
+	{Label: "E-H", Selector: "e-h", Start: "E", End: "H"},
+	{Label: "I-L", Selector: "i-l", Start: "I", End: "L"},
+	{Label: "M-P", Selector: "m-p", Start: "M", End: "P"},
+	{Label: "Q-T", Selector: "q-t", Start: "Q", End: "T"},
+	{Label: "U-Z", Selector: "u-z", Start: "U", End: "Z"},
+	{Label: "Other", Selector: "other", Start: "#", End: "#"},
+}
+
 func (s *Server) HandleCatalog(w http.ResponseWriter, r *http.Request) {
-	books, err := s.db.GetAllBooks()
+	selector := strings.TrimSpace(r.URL.Query().Get("authors"))
+	if selector != "" {
+		s.handleAuthorRangeFeed(w, r, selector)
+		return
+	}
+	s.handleCatalogNavigation(w, r)
+}
+
+func (s *Server) HandleAuthorsCatalog(w http.ResponseWriter, r *http.Request) {
+	selector := strings.TrimSpace(r.URL.Query().Get("authors"))
+	if selector != "" {
+		s.handleAuthorRangeFeed(w, r, selector)
+		return
+	}
+	s.handleCatalogNavigation(w, r)
+}
+
+func (s *Server) HandleCategoriesCatalog(w http.ResponseWriter, r *http.Request) {
+	category := strings.TrimSpace(r.URL.Query().Get("category"))
+	subcategory := strings.TrimSpace(r.URL.Query().Get("subcategory"))
+	if category == "" {
+		s.handleCategoryNavigation(w, r)
+		return
+	}
+	if subcategory != "" {
+		s.handleCategoryBooksFeed(w, r, category, subcategory)
+		return
+	}
+	subCounts, err := s.db.GetSubcategoryCounts(category)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	if len(subCounts) == 0 {
+		s.handleCategoryBooksFeed(w, r, category, "")
+		return
+	}
+	s.handleSubcategoryNavigation(w, r, category, subCounts)
+}
+
+func (s *Server) handleCatalogNavigation(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/atom+xml;profile=opds-catalog;kind=navigation;charset=utf-8")
+	fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">`)
+	fmt.Fprint(w, `<title>GoPDS Library</title><id>gopds:catalog:root</id>`)
+	fmt.Fprintf(w, `<updated>%s</updated>`, time.Now().UTC().Format(time.RFC3339))
+	fmt.Fprint(w, `<link rel="self" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>`)
+
+	for _, b := range defaultAuthorBuckets {
+		count, err := s.db.CountBooksByAuthorRange(b.Start, b.End, false)
+		if err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		href := fmt.Sprintf("/opds?authors=%s&page=1&limit=100", url.QueryEscape(b.Selector))
+		fmt.Fprintf(w, `
+    <entry>
+        <title>Authors %s (%d)</title>
+        <id>gopds:authors:%s</id>
+        <link rel="subsection" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+    </entry>`, html.EscapeString(b.Label), count, html.EscapeString(b.Selector), html.EscapeString(href))
+	}
+	categoryCounts, err := s.db.GetCategoryCounts()
+	if err == nil && len(categoryCounts) > 0 {
+		total := 0
+		for _, c := range categoryCounts {
+			total += c
+		}
+		fmt.Fprintf(w, `
+    <entry>
+        <title>Browse by Category (%d)</title>
+        <id>gopds:categories</id>
+        <link rel="subsection" href="/opds/categories" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+    </entry>`, total)
+	}
+	fmt.Fprint(w, `</feed>`)
+}
+
+func (s *Server) handleAuthorRangeFeed(w http.ResponseWriter, r *http.Request, selector string) {
+	start, end, label, err := parseAuthorRangeSelector(selector)
+	if err != nil {
+		http.Error(w, "Invalid authors selector. Use authors=a or authors=a-d", http.StatusBadRequest)
+		return
+	}
+
+	page := parseIntDefault(r.URL.Query().Get("page"), 1)
+	if page < 1 {
+		page = 1
+	}
+	limit := parseIntDefault(r.URL.Query().Get("limit"), 100)
+	if limit < 1 {
+		limit = 100
+	}
+	if limit > 250 {
+		limit = 250
+	}
+
+	total, err := s.db.CountBooksByAuthorRange(start, end, false)
 	if err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/xml")
-	fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom"><title>GoPDS Library</title>`)
+	lastPage := 1
+	if total > 0 {
+		lastPage = (total + limit - 1) / limit
+	}
+	if page > lastPage {
+		page = lastPage
+	}
+	offset := (page - 1) * limit
+
+	books, err := s.db.GetBooksByAuthorRange(start, end, false, limit, offset)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	base := fmt.Sprintf("/opds?authors=%s&limit=%d", url.QueryEscape(strings.ToLower(selector)), limit)
+	self := fmt.Sprintf("%s&page=%d", base, page)
+	first := fmt.Sprintf("%s&page=1", base)
+	last := fmt.Sprintf("%s&page=%d", base, lastPage)
+
+	w.Header().Set("Content-Type", "application/atom+xml;profile=opds-catalog;kind=acquisition;charset=utf-8")
+	fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">`)
+	fmt.Fprintf(w, `<title>GoPDS Library - Authors %s (%d)</title>`, html.EscapeString(label), total)
+	fmt.Fprintf(w, `<id>gopds:authors:%s:page:%d</id>`, html.EscapeString(strings.ToLower(selector)), page)
+	fmt.Fprintf(w, `<updated>%s</updated>`, time.Now().UTC().Format(time.RFC3339))
+	fmt.Fprintf(w, `<link rel="self" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(self))
+	fmt.Fprint(w, `<link rel="start" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>`)
+	fmt.Fprint(w, `<link rel="up" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>`)
+	fmt.Fprintf(w, `<link rel="first" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(first))
+	fmt.Fprintf(w, `<link rel="last" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(last))
+	if page > 1 {
+		prev := fmt.Sprintf("%s&page=%d", base, page-1)
+		fmt.Fprintf(w, `<link rel="previous" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(prev))
+	}
+	if page < lastPage {
+		next := fmt.Sprintf("%s&page=%d", base, page+1)
+		fmt.Fprintf(w, `<link rel="next" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(next))
+	}
+
 	for _, b := range books {
-		safeTitle := html.EscapeString(b.Title)
-		safeAuthor := html.EscapeString(b.Author)
+		writeOPDSEntry(w, b)
+	}
+	fmt.Fprint(w, `</feed>`)
+}
+
+func (s *Server) handleCategoryNavigation(w http.ResponseWriter, r *http.Request) {
+	counts, err := s.db.GetCategoryCounts()
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/atom+xml;profile=opds-catalog;kind=navigation;charset=utf-8")
+	fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">`)
+	fmt.Fprint(w, `<title>GoPDS Library - Categories</title><id>gopds:categories</id>`)
+	fmt.Fprintf(w, `<updated>%s</updated>`, time.Now().UTC().Format(time.RFC3339))
+	fmt.Fprint(w, `<link rel="self" href="/opds/categories" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>`)
+	fmt.Fprint(w, `<link rel="start" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>`)
+
+	keys := make([]string, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return strings.ToLower(keys[i]) < strings.ToLower(keys[j]) })
+
+	for _, category := range keys {
+		count := counts[category]
+		href := "/opds/categories?category=" + url.QueryEscape(category)
 		fmt.Fprintf(w, `
+    <entry>
+        <title>%s (%d)</title>
+        <id>gopds:category:%s</id>
+        <link rel="subsection" href="%s" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+    </entry>`,
+			html.EscapeString(category), count, html.EscapeString(strings.ToLower(category)), html.EscapeString(href))
+	}
+
+	fmt.Fprint(w, `</feed>`)
+}
+
+func (s *Server) handleSubcategoryNavigation(w http.ResponseWriter, r *http.Request, category string, subCounts map[string]int) {
+	w.Header().Set("Content-Type", "application/atom+xml;profile=opds-catalog;kind=navigation;charset=utf-8")
+	fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">`)
+	fmt.Fprintf(w, `<title>GoPDS Library - %s</title>`, html.EscapeString(category))
+	fmt.Fprintf(w, `<id>gopds:category:%s</id>`, html.EscapeString(strings.ToLower(category)))
+	fmt.Fprintf(w, `<updated>%s</updated>`, time.Now().UTC().Format(time.RFC3339))
+	fmt.Fprintf(w, `<link rel="self" href="/opds/categories?category=%s" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>`, url.QueryEscape(category))
+	fmt.Fprint(w, `<link rel="up" href="/opds/categories" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>`)
+
+	keys := make([]string, 0, len(subCounts))
+	for k := range subCounts {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return strings.ToLower(keys[i]) < strings.ToLower(keys[j]) })
+
+	totalHref := fmt.Sprintf("/opds/categories?category=%s&page=1&limit=100", url.QueryEscape(category))
+	totalCount, _ := s.db.CountBooksByCategory(category, "")
+	fmt.Fprintf(w, `
+    <entry>
+        <title>All in %s (%d)</title>
+        <id>gopds:category:%s:all</id>
+        <link rel="subsection" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+    </entry>`, html.EscapeString(category), totalCount, html.EscapeString(strings.ToLower(category)), html.EscapeString(totalHref))
+
+	for _, sub := range keys {
+		count := subCounts[sub]
+		href := fmt.Sprintf("/opds/categories?category=%s&subcategory=%s&page=1&limit=100", url.QueryEscape(category), url.QueryEscape(sub))
+		fmt.Fprintf(w, `
+    <entry>
+        <title>%s / %s (%d)</title>
+        <id>gopds:category:%s:%s</id>
+        <link rel="subsection" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+    </entry>`,
+			html.EscapeString(category), html.EscapeString(sub), count,
+			html.EscapeString(strings.ToLower(category)), html.EscapeString(strings.ToLower(sub)),
+			html.EscapeString(href))
+	}
+	fmt.Fprint(w, `</feed>`)
+}
+
+func (s *Server) handleCategoryBooksFeed(w http.ResponseWriter, r *http.Request, category, subcategory string) {
+	page := parseIntDefault(r.URL.Query().Get("page"), 1)
+	if page < 1 {
+		page = 1
+	}
+	limit := parseIntDefault(r.URL.Query().Get("limit"), 100)
+	if limit < 1 {
+		limit = 100
+	}
+	if limit > 250 {
+		limit = 250
+	}
+
+	total, err := s.db.CountBooksByCategory(category, subcategory)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	lastPage := 1
+	if total > 0 {
+		lastPage = (total + limit - 1) / limit
+	}
+	if page > lastPage {
+		page = lastPage
+	}
+	offset := (page - 1) * limit
+
+	books, err := s.db.GetBooksByCategory(category, subcategory, limit, offset)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	base := fmt.Sprintf("/opds/categories?category=%s&limit=%d", url.QueryEscape(category), limit)
+	if subcategory != "" {
+		base += "&subcategory=" + url.QueryEscape(subcategory)
+	}
+	self := fmt.Sprintf("%s&page=%d", base, page)
+	first := fmt.Sprintf("%s&page=1", base)
+	last := fmt.Sprintf("%s&page=%d", base, lastPage)
+	title := category
+	if subcategory != "" {
+		title = category + " / " + subcategory
+	}
+
+	w.Header().Set("Content-Type", "application/atom+xml;profile=opds-catalog;kind=acquisition;charset=utf-8")
+	fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">`)
+	fmt.Fprintf(w, `<title>GoPDS Library - %s (%d)</title>`, html.EscapeString(title), total)
+	fmt.Fprintf(w, `<id>gopds:category:%s:%d</id>`, html.EscapeString(strings.ToLower(title)), page)
+	fmt.Fprintf(w, `<updated>%s</updated>`, time.Now().UTC().Format(time.RFC3339))
+	fmt.Fprintf(w, `<link rel="self" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(self))
+	fmt.Fprint(w, `<link rel="up" href="/opds/categories" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>`)
+	fmt.Fprintf(w, `<link rel="first" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(first))
+	fmt.Fprintf(w, `<link rel="last" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(last))
+	if page > 1 {
+		prev := fmt.Sprintf("%s&page=%d", base, page-1)
+		fmt.Fprintf(w, `<link rel="previous" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(prev))
+	}
+	if page < lastPage {
+		next := fmt.Sprintf("%s&page=%d", base, page+1)
+		fmt.Fprintf(w, `<link rel="next" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(next))
+	}
+
+	for _, b := range books {
+		writeOPDSEntry(w, b)
+	}
+	fmt.Fprint(w, `</feed>`)
+}
+
+func writeOPDSEntry(w io.Writer, b database.Book) {
+	safeTitle := html.EscapeString(b.Title)
+	safeAuthor := html.EscapeString(b.Author)
+	fmt.Fprintf(w, `
     <entry>
         <title>%s</title>
         <id>%d</id>
-        <author><name>%s</name></author>
+        <author><name>%s</name></author>`, safeTitle, b.ID, safeAuthor)
+	if strings.TrimSpace(b.Category) != "" {
+		fmt.Fprintf(w, `<category term="%s" label="%s"/>`, html.EscapeString(b.Category), html.EscapeString(b.Category))
+	}
+	if strings.TrimSpace(b.Subcategory) != "" {
+		label := b.Category + " / " + b.Subcategory
+		fmt.Fprintf(w, `<category term="%s" label="%s"/>`, html.EscapeString(label), html.EscapeString(label))
+	}
+	fmt.Fprintf(w, `
         <link rel="http://opds-spec.org/image" href="/covers/%d.jpg" type="image/jpeg"/>
         <link rel="http://opds-spec.org/acquisition" href="/download/%d" type="application/epub+zip"/>
-    </entry>`, safeTitle, b.ID, safeAuthor, b.ID, b.ID)
+    </entry>`, b.ID, b.ID)
+}
+
+func parseAuthorRangeSelector(selector string) (string, string, string, error) {
+	s := strings.ToUpper(strings.TrimSpace(selector))
+	if s == "OTHER" || s == "#" {
+		return "#", "#", "Other", nil
 	}
-	fmt.Fprint(w, `</feed>`)
+
+	if len(s) == 1 && s[0] >= 'A' && s[0] <= 'Z' {
+		return s, s, s, nil
+	}
+
+	parts := strings.Split(s, "-")
+	if len(parts) == 2 && len(parts[0]) == 1 && len(parts[1]) == 1 {
+		a := parts[0][0]
+		b := parts[1][0]
+		if a >= 'A' && a <= 'Z' && b >= 'A' && b <= 'Z' && a <= b {
+			return string(a), string(b), fmt.Sprintf("%c-%c", a, b), nil
+		}
+	}
+
+	return "", "", "", fmt.Errorf("invalid selector")
+}
+
+func parseIntDefault(raw string, fallback int) int {
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
+	accept := strings.ToLower(strings.TrimSpace(r.Header.Get("Accept")))
+	ua := strings.ToLower(strings.TrimSpace(r.Header.Get("User-Agent")))
+
+	// Serve OPDS catalog at root for OPDS/e-reader clients, while keeping HTML UI for browsers.
+	wantsOPDS := strings.Contains(accept, "application/atom+xml") ||
+		strings.Contains(accept, "application/opds+json") ||
+		(strings.Contains(accept, "application/xml") && !strings.Contains(accept, "text/html")) ||
+		(strings.Contains(accept, "*/*") && !strings.Contains(accept, "text/html")) ||
+		strings.Contains(ua, "thorium")
+
+	if wantsOPDS || r.URL.Query().Get("opds") == "1" {
+		s.HandleCatalog(w, r)
+		return
+	}
+
+	indexContent, err := s.uiFS.ReadFile("web/ui/index.html")
+	if err != nil {
+		http.Error(w, "UI not found", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(indexContent)
+}
+
+func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := s.authenticatedUser(r); !ok {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) HandleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	username, ok := s.authenticatedUser(r)
+	w.Header().Set("Content-Type", "application/json")
+	if !ok {
+		_ = json.NewEncoder(w).Encode(authStatusPayload{Authenticated: false})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(authStatusPayload{
+		Authenticated: true,
+		Username:      username,
+	})
+}
+
+func (s *Server) HandleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if strings.TrimSpace(s.adminPass) == "" {
+		http.Error(w, "Authentication is not configured on server", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req loginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	req.Username = strings.TrimSpace(req.Username)
+	if req.Username == "" {
+		req.Username = "admin"
+	}
+
+	if req.Username != s.adminUser || req.Password != s.adminPass {
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	token, err := generateSessionToken()
+	if err != nil {
+		http.Error(w, "Failed to create session", http.StatusInternalServerError)
+		return
+	}
+
+	expiresAt := time.Now().UTC().Add(sessionTTL)
+	s.sessionMu.Lock()
+	s.sessions[token] = authSession{
+		Username:  req.Username,
+		ExpiresAt: expiresAt,
+	}
+	s.sessionMu.Unlock()
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  expiresAt,
+		MaxAge:   int(sessionTTL.Seconds()),
+		Secure:   r.TLS != nil,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(authStatusPayload{
+		Authenticated: true,
+		Username:      req.Username,
+	})
+}
+
+func (s *Server) HandleAuthLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(sessionCookieName); err == nil {
+		token := strings.TrimSpace(c.Value)
+		if token != "" {
+			s.sessionMu.Lock()
+			delete(s.sessions, token)
+			s.sessionMu.Unlock()
+		}
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+		Secure:   r.TLS != nil,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(authStatusPayload{Authenticated: false})
+}
+
+func (s *Server) authenticatedUser(r *http.Request) (string, bool) {
+	if strings.TrimSpace(s.adminPass) == "" {
+		return "", false
+	}
+
+	c, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return "", false
+	}
+	token := strings.TrimSpace(c.Value)
+	if token == "" {
+		return "", false
+	}
+
+	now := time.Now().UTC()
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	sess, ok := s.sessions[token]
+	if !ok {
+		return "", false
+	}
+	if now.After(sess.ExpiresAt) {
+		delete(s.sessions, token)
+		return "", false
+	}
+	return sess.Username, true
+}
+
+func generateSessionToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
 }
 
 func (s *Server) HandleBooksJSON(w http.ResponseWriter, r *http.Request) {
@@ -218,9 +805,15 @@ func (s *Server) HandleLiveMetadata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	meta, err := scanner.ExtractLiveMetadata(book.Path)
+	bookPath, err := s.resolveBookPath(book)
 	if err != nil {
-		http.Error(w, "Failed to read EPUB metadata", http.StatusUnprocessableEntity)
+		http.Error(w, fmt.Sprintf("Failed to read EPUB metadata: %v", err), http.StatusUnprocessableEntity)
+		return
+	}
+
+	meta, err := scanner.ExtractLiveMetadata(bookPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to read EPUB metadata: %v", err), http.StatusUnprocessableEntity)
 		return
 	}
 
@@ -660,6 +1253,12 @@ func (s *Server) HandleUpdateMetadata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	bookPath, err := s.resolveBookPath(book)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to update EPUB metadata: %v", err), http.StatusUnprocessableEntity)
+		return
+	}
+
 	var req metadataRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
@@ -684,7 +1283,7 @@ func (s *Server) HandleUpdateMetadata(w http.ResponseWriter, r *http.Request) {
 		req.Author = "Unknown Author"
 	}
 
-	meta, err := scanner.UpdateEPUBMetadata(book.Path, scanner.MetadataUpdate{
+	meta, err := scanner.UpdateEPUBMetadata(bookPath, scanner.MetadataUpdate{
 		Title:       req.Title,
 		Creator:     req.Author,
 		Language:    req.Language,
@@ -705,12 +1304,12 @@ func (s *Server) HandleUpdateMetadata(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Unable to locate metadata tags in EPUB", http.StatusUnprocessableEntity)
 			return
 		}
-		log.Printf("metadata update error for %s: %v", book.Path, err)
+		log.Printf("metadata update error for %s: %v", bookPath, err)
 		http.Error(w, "Failed to update EPUB metadata", http.StatusUnprocessableEntity)
 		return
 	}
 
-	info, statErr := os.Stat(book.Path)
+	info, statErr := os.Stat(bookPath)
 	if statErr != nil {
 		http.Error(w, "Metadata saved but failed to read file mod time", http.StatusInternalServerError)
 		return
@@ -747,6 +1346,181 @@ func (s *Server) HandleUpdateMetadata(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) HandleCoverCandidates(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	book, err := s.db.GetBookByID(id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "Book not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	bookPath, err := s.resolveBookPath(book)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to locate EPUB: %v", err), http.StatusUnprocessableEntity)
+		return
+	}
+
+	options, err := scanner.ListCoverOptions(bookPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to list cover candidates: %v", err), http.StatusUnprocessableEntity)
+		return
+	}
+
+	out := make([]coverCandidate, 0, len(options))
+	for _, c := range options {
+		key := encodeCoverKey(c.ZipPath)
+		out = append(out, coverCandidate{
+			Key:        key,
+			Name:       c.Name,
+			MediaType:  c.MediaType,
+			Width:      c.Width,
+			Height:     c.Height,
+			IsCurrent:  c.IsCurrent,
+			PreviewURL: fmt.Sprintf("/api/books/%d/covers/candidates/%s", book.ID, url.PathEscape(key)),
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		BookID     int              `json:"book_id"`
+		Candidates []coverCandidate `json:"candidates"`
+	}{
+		BookID:     book.ID,
+		Candidates: out,
+	})
+}
+
+func (s *Server) HandleCoverCandidateImage(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	book, err := s.db.GetBookByID(id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "Book not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	bookPath, err := s.resolveBookPath(book)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to locate EPUB: %v", err), http.StatusUnprocessableEntity)
+		return
+	}
+
+	key := chi.URLParam(r, "key")
+	zipPath, err := decodeCoverKey(key)
+	if err != nil {
+		http.Error(w, "Invalid cover key", http.StatusBadRequest)
+		return
+	}
+
+	raw, _, err := scanner.ReadCoverOption(bookPath, zipPath)
+	if err != nil {
+		http.Error(w, "Cover candidate not found", http.StatusNotFound)
+		return
+	}
+
+	contentType := "image/jpeg"
+	if strings.HasSuffix(strings.ToLower(zipPath), ".png") {
+		contentType = "image/png"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(raw)
+}
+
+func (s *Server) HandleUpdateCover(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	book, err := s.db.GetBookByID(id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "Book not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	bookPath, err := s.resolveBookPath(book)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to locate EPUB: %v", err), http.StatusUnprocessableEntity)
+		return
+	}
+
+	var req updateCoverRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	req.Key = strings.TrimSpace(req.Key)
+	if req.Key == "" {
+		http.Error(w, "Cover key is required", http.StatusBadRequest)
+		return
+	}
+
+	zipPath, err := decodeCoverKey(req.Key)
+	if err != nil {
+		http.Error(w, "Invalid cover key", http.StatusBadRequest)
+		return
+	}
+
+	raw, _, err := scanner.ReadCoverOption(bookPath, zipPath)
+	if err != nil {
+		http.Error(w, "Cover candidate not found", http.StatusNotFound)
+		return
+	}
+
+	cacheJPG, err := scanner.ConvertImageToJPEG(raw)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Cover conversion failed: %v", err), http.StatusUnprocessableEntity)
+		return
+	}
+
+	if err := os.MkdirAll("./data/covers", 0755); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to prepare covers cache: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if err := os.WriteFile(fmt.Sprintf("./data/covers/%d.jpg", book.ID), cacheJPG, 0644); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to update cover cache: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if req.WriteToEPUB {
+		if err := scanner.WriteCoverToEPUB(bookPath, zipPath); err != nil {
+			http.Error(w, fmt.Sprintf("Failed writing cover to EPUB: %v", err), http.StatusUnprocessableEntity)
+			return
+		}
+		localCoverPath := filepath.Join(filepath.Dir(bookPath), "cover.jpg")
+		if err := os.WriteFile(localCoverPath, cacheJPG, 0644); err != nil {
+			if errors.Is(err, os.ErrPermission) {
+				http.Error(w, "Write permission denied for sibling cover.jpg", http.StatusForbidden)
+				return
+			}
+			http.Error(w, fmt.Sprintf("Failed writing sibling cover.jpg: %v", err), http.StatusUnprocessableEntity)
+			return
+		}
+		if info, err := os.Stat(bookPath); err == nil {
+			_ = s.db.UpdateBookMetadata(book.ID, book.Title, book.Author, book.Description, info.ModTime())
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK          bool `json:"ok"`
+		BookID      int  `json:"book_id"`
+		WroteToEPUB bool `json:"wrote_to_epub"`
+	}{
+		OK:          true,
+		BookID:      book.ID,
+		WroteToEPUB: req.WriteToEPUB,
+	})
+}
+
 func (s *Server) HandleCover(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	coverPath := fmt.Sprintf("data/covers/%s.jpg", id)
@@ -762,7 +1536,270 @@ func (s *Server) HandleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	bookPath, err := s.resolveBookPath(book)
+	if err != nil {
+		log.Printf("Download error (ID %s): %v", id, err)
+		http.Error(w, "Book file not found", http.StatusNotFound)
+		return
+	}
+
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.epub\"", book.Title))
 	w.Header().Set("Content-Type", "application/epub+zip")
-	http.ServeFile(w, r, book.Path)
+	http.ServeFile(w, r, bookPath)
+}
+
+func (s *Server) HandleRebuildLibrary(w http.ResponseWriter, r *http.Request) {
+	s.startScanJob(w, "rebuild")
+}
+
+func (s *Server) HandleRescanLibrary(w http.ResponseWriter, r *http.Request) {
+	s.startScanJob(w, "rescan")
+}
+
+func (s *Server) startScanJob(w http.ResponseWriter, operation string) {
+	s.rebuildMu.Lock()
+	if s.rebuildState.Running {
+		status := s.rebuildState
+		s.rebuildMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(status)
+		return
+	}
+	startedAt := time.Now().UTC()
+	label := "Rebuild"
+	if operation == "rescan" {
+		label = "Rescan"
+	}
+	s.rebuildState = rebuildStatus{
+		Running:   true,
+		Operation: operation,
+		Phase:     "queued",
+		Message:   label + " queued.",
+		StartedAt: startedAt,
+	}
+	status := s.rebuildState
+	s.rebuildMu.Unlock()
+
+	go s.runScanJob(operation)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(status)
+}
+
+func (s *Server) HandleRebuildStatus(w http.ResponseWriter, r *http.Request) {
+	s.rebuildMu.Lock()
+	status := s.rebuildState
+	s.rebuildMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(status)
+}
+
+func encodeCoverKey(zipPath string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(zipPath))
+}
+
+func decodeCoverKey(key string) (string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(key))
+	if err != nil {
+		return "", err
+	}
+	p := strings.TrimSpace(string(raw))
+	if p == "" {
+		return "", fmt.Errorf("empty cover key")
+	}
+	return p, nil
+}
+
+func (s *Server) runScanJob(operation string) {
+	label := "Rebuild"
+	if operation == "rescan" {
+		label = "Rescan"
+	}
+
+	if operation == "rebuild" {
+		s.setRebuildProgress("resetting_db", "Resetting database cache...")
+		if err := s.db.RebuildBooksTable(); err != nil {
+			s.finishRebuildWithError(fmt.Sprintf("Failed to reset database: %v", err), label)
+			return
+		}
+
+		s.setRebuildProgress("clearing_covers", "Clearing covers cache...")
+		if err := os.RemoveAll("./data/covers"); err != nil {
+			s.finishRebuildWithError(fmt.Sprintf("Failed to clear covers cache: %v", err), label)
+			return
+		}
+		if err := os.MkdirAll("./data/covers", 0755); err != nil {
+			s.finishRebuildWithError(fmt.Sprintf("Failed to recreate covers cache: %v", err), label)
+			return
+		}
+	}
+
+	bookPath := strings.TrimSpace(os.Getenv("BOOK_PATH"))
+	if bookPath == "" {
+		bookPath = "./books"
+	}
+
+	s.setRebuildProgress("scanning", "Scanning library...")
+	sc := scanner.New(s.db)
+	if err := sc.Start(bookPath); err != nil {
+		s.finishRebuildWithError(fmt.Sprintf("%s scan failed: %v", label, err), label)
+		return
+	}
+
+	books, err := s.db.GetAllBooks()
+	if err != nil {
+		s.finishRebuildWithError(fmt.Sprintf("%s finished but listing failed: %v", label, err), label)
+		return
+	}
+
+	s.rebuildMu.Lock()
+	s.rebuildState.Running = false
+	s.rebuildState.Phase = "complete"
+	s.rebuildState.Message = fmt.Sprintf("%s complete. %d books indexed.", label, len(books))
+	s.rebuildState.Error = ""
+	s.rebuildState.Count = len(books)
+	s.rebuildState.CompletedAt = time.Now().UTC()
+	s.rebuildMu.Unlock()
+}
+
+func (s *Server) setRebuildProgress(phase, message string) {
+	s.rebuildMu.Lock()
+	s.rebuildState.Phase = phase
+	s.rebuildState.Message = message
+	s.rebuildMu.Unlock()
+}
+
+func (s *Server) finishRebuildWithError(message string, label string) {
+	s.rebuildMu.Lock()
+	s.rebuildState.Running = false
+	s.rebuildState.Phase = "failed"
+	s.rebuildState.Message = label + " failed."
+	s.rebuildState.Error = message
+	s.rebuildState.CompletedAt = time.Now().UTC()
+	s.rebuildMu.Unlock()
+}
+
+func (s *Server) resolveBookPath(book *database.Book) (string, error) {
+	if book == nil {
+		return "", fmt.Errorf("book is nil")
+	}
+
+	current := strings.TrimSpace(book.Path)
+	if current == "" {
+		return "", fmt.Errorf("book path is empty")
+	}
+
+	if _, err := os.Stat(current); err == nil {
+		return current, nil
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	root := strings.TrimSpace(os.Getenv("BOOK_PATH"))
+	base := filepath.Base(current)
+	if base == "" || strings.EqualFold(base, ".") || strings.EqualFold(base, string(filepath.Separator)) {
+		return "", fmt.Errorf("book file missing and cannot infer filename from path %q", current)
+	}
+
+	roots := make([]string, 0, 4)
+	if root != "" {
+		roots = append(roots, root)
+	}
+	roots = append(roots, "./books")
+	if ancestor := nearestExistingDir(current); ancestor != "" {
+		roots = append(roots, ancestor)
+	}
+	if parent := nearestExistingDir(filepath.Dir(current)); parent != "" {
+		roots = append(roots, parent)
+	}
+
+	recovered, err := findEPUBByBaseNameAcrossRoots(base, roots)
+	if err != nil {
+		return "", fmt.Errorf("open %s: %w", current, os.ErrNotExist)
+	}
+
+	if err := s.db.UpdateBookPath(book.ID, recovered); err != nil {
+		log.Printf("failed to update recovered book path for id=%d: %v", book.ID, err)
+	} else {
+		book.Path = recovered
+		log.Printf("recovered missing book path for id=%d: %s -> %s", book.ID, current, recovered)
+	}
+
+	return recovered, nil
+}
+
+func findEPUBByBaseNameAcrossRoots(base string, roots []string) (string, error) {
+	seen := map[string]struct{}{}
+	for _, root := range roots {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			continue
+		}
+		cleanRoot := filepath.Clean(root)
+		if _, ok := seen[cleanRoot]; ok {
+			continue
+		}
+		seen[cleanRoot] = struct{}{}
+
+		if info, err := os.Stat(cleanRoot); err != nil || !info.IsDir() {
+			continue
+		}
+		match, err := findEPUBByBaseName(cleanRoot, base)
+		if err == nil && match != "" {
+			return match, nil
+		}
+	}
+	return "", os.ErrNotExist
+}
+
+func findEPUBByBaseName(root, base string) (string, error) {
+	target := strings.ToLower(strings.TrimSpace(base))
+	if target == "" {
+		return "", os.ErrNotExist
+	}
+
+	var match string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(d.Name()), ".epub") {
+			return nil
+		}
+		if strings.ToLower(d.Name()) == target {
+			match = path
+			return io.EOF
+		}
+		return nil
+	})
+	if errors.Is(err, io.EOF) && match != "" {
+		return match, nil
+	}
+	if match != "" {
+		return match, nil
+	}
+	return "", os.ErrNotExist
+}
+
+func nearestExistingDir(path string) string {
+	p := filepath.Clean(strings.TrimSpace(path))
+	if p == "" {
+		return ""
+	}
+	for {
+		info, err := os.Stat(p)
+		if err == nil && info.IsDir() {
+			return p
+		}
+		next := filepath.Dir(p)
+		if next == p {
+			return ""
+		}
+		p = next
+	}
 }
