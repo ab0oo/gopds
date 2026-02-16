@@ -147,3 +147,7 @@ GitHub Actions workflow:
 - Run behind HTTPS reverse proxy for internet exposure.
 - Protect `main` with required signed commits.
 - Keep GHCR package visibility intentional (public/private).
+
+## License
+
+This project is licensed under the MIT License. See `LICENSE`.
