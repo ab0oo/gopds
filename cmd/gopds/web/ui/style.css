@@ -191,6 +191,8 @@ button {
 }
 
 .edit-toggle,
+.book-info,
+.change-cover,
 #modal-save,
 #ol-fetch,
 .field-apply,
@@ -208,6 +210,12 @@ button {
     width: 100%;
     background: #184947;
     border-color: #2e7a77;
+}
+
+.book-info {
+    width: 100%;
+    background: #2a243f;
+    border-color: #4f4380;
 }
 
 .change-cover {
@@ -368,6 +376,40 @@ button {
     width: min(980px, 96vw);
 }
 
+.info-modal-dialog {
+    width: min(900px, 94vw);
+}
+
+.info-grid {
+    display: grid;
+    gap: 8px;
+}
+
+.info-row {
+    display: grid;
+    grid-template-columns: 170px 1fr;
+    gap: 8px;
+    align-items: start;
+    border-top: 1px solid #22313d;
+    padding-top: 8px;
+}
+
+.info-label {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    text-transform: uppercase;
+}
+
+.info-value {
+    border: 1px solid #2a3b48;
+    border-radius: 8px;
+    background: #0d141b;
+    color: var(--text-main);
+    padding: 8px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 .cover-status {
     color: var(--text-muted);
     font-size: 0.9rem;
@@ -448,6 +490,10 @@ button {
 
     .field-label {
         padding-top: 0;
+    }
+
+    .info-row {
+        grid-template-columns: 1fr;
     }
 }
 

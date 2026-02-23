@@ -22,6 +22,7 @@ const App = {
     currentIndex: 0,
     itemsPerPage: 50,
     modalBookId: null,
+    infoModalBookId: null,
     coverModalBookId: null,
     openLibraryResults: [],
     selectedOpenLibrary: null,
@@ -52,6 +53,7 @@ const App = {
 
     async init() {
         this.createModal();
+        this.createInfoModal();
         this.createCoverModal();
         this.bindEvents();
         await this.syncAuthStatus();
@@ -140,6 +142,13 @@ const App = {
 
         this.ui.library.addEventListener('click', (e) => this.handleLibraryClick(e));
 
+        this.ui.infoModal.addEventListener('click', (e) => {
+            if (e.target.dataset.closeInfoModal === '1') {
+                this.closeInfoModal();
+            }
+        });
+        this.ui.infoModalClose.addEventListener('click', () => this.closeInfoModal());
+
         this.ui.modal.addEventListener('click', (e) => {
             if (e.target.dataset.closeModal === '1') {
                 this.closeModal();
@@ -175,10 +184,36 @@ const App = {
             if (e.key === 'Escape' && !this.ui.modal.classList.contains('hidden')) {
                 this.closeModal();
             }
+            if (e.key === 'Escape' && !this.ui.infoModal.classList.contains('hidden')) {
+                this.closeInfoModal();
+            }
             if (e.key === 'Escape' && !this.ui.coverModal.classList.contains('hidden')) {
                 this.closeCoverModal();
             }
         });
+    },
+
+    createInfoModal() {
+        const modal = document.createElement('div');
+        modal.id = 'book-info-modal';
+        modal.className = 'modal hidden';
+        modal.innerHTML = `
+            <div class="modal-backdrop" data-close-info-modal="1"></div>
+            <div class="modal-dialog info-modal-dialog" role="dialog" aria-modal="true" aria-label="Book info">
+                <div class="modal-header">
+                    <h2>Book Info</h2>
+                    <button type="button" id="info-modal-close" class="modal-close" aria-label="Close">&times;</button>
+                </div>
+                <div class="modal-book" id="info-modal-book"></div>
+                <div class="info-grid" id="info-modal-fields"></div>
+            </div>
+        `;
+
+        document.body.appendChild(modal);
+        this.ui.infoModal = modal;
+        this.ui.infoModalClose = modal.querySelector('#info-modal-close');
+        this.ui.infoModalBook = modal.querySelector('#info-modal-book');
+        this.ui.infoModalFields = modal.querySelector('#info-modal-fields');
     },
 
     createCoverModal() {
@@ -618,6 +653,17 @@ const App = {
     },
 
     handleLibraryClick(e) {
+        const infoButton = e.target.closest('.book-info');
+        if (infoButton) {
+            const id = Number(infoButton.dataset.bookId);
+            const book = this.allBooks.find((b) => b.id === id);
+            if (!book) {
+                return;
+            }
+            this.openInfoModal(book);
+            return;
+        }
+
         const editButton = e.target.closest('.edit-toggle');
         if (editButton) {
             if (!this.auth.authenticated) {
@@ -687,6 +733,34 @@ const App = {
             this.ui.coverModalApply.disabled = true;
             console.error(err);
         }
+    },
+
+    openInfoModal(book) {
+        this.infoModalBookId = book.id;
+        this.ui.infoModalBook.textContent = `Book #${book.id} | ${book.title || 'Untitled'}`;
+
+        const rows = [
+            ['Title', book.title || '-'],
+            ['Author', book.author || '-'],
+            ['Category', book.category || '-'],
+            ['Sub-category', book.subcategory || '-'],
+            ['Description', book.description || '-'],
+            ['Path', book.path || '-'],
+            ['Modified', this.formatDateTime(book.mod_time)]
+        ];
+
+        this.ui.infoModalFields.innerHTML = rows.map(([label, value]) => `
+            <div class="info-row">
+                <div class="info-label">${this.escapeHTML(label)}</div>
+                <div class="info-value">${this.escapeHTML(value)}</div>
+            </div>
+        `).join('');
+        this.ui.infoModal.classList.remove('hidden');
+    },
+
+    closeInfoModal() {
+        this.infoModalBookId = null;
+        this.ui.infoModal.classList.add('hidden');
     },
 
     closeCoverModal() {
@@ -1111,6 +1185,7 @@ const App = {
                 <small>${this.escapeHTML(book.author || '')}</small>
                 <div class="book-actions">
                     <a class="book-download" href="/download/${book.id}">Download</a>
+                    <button type="button" class="book-info" data-book-id="${book.id}">Book Info</button>
                     ${this.auth.authenticated ? `<button type="button" class="edit-toggle" data-book-id="${book.id}">Edit Metadata</button>` : ''}
                     ${this.auth.authenticated ? `<button type="button" class="change-cover" data-book-id="${book.id}">Change Cover</button>` : ''}
                 </div>
@@ -1129,6 +1204,17 @@ const App = {
             .replaceAll('>', '&gt;')
             .replaceAll('"', '&quot;')
             .replaceAll("'", '&#39;');
+    },
+
+    formatDateTime(value) {
+        if (!value) {
+            return '-';
+        }
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) {
+            return String(value);
+        }
+        return date.toLocaleString();
     }
 };
 
