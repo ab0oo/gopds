@@ -4,6 +4,7 @@ package database
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -608,4 +609,36 @@ func (db *DB) ClearEnrichmentReview(bookID int) error {
 	_, err := db.conn.Exec(
 		`UPDATE book_enrichment SET review_flags='' WHERE book_id = ?`, bookID)
 	return err
+}
+
+// SaveEnrichmentScore updates a book's quality score and review flags outside
+// of a scan transaction. Locked books are left untouched.
+func (db *DB) SaveEnrichmentScore(bookID int, quality int, flags string) error {
+	_, err := db.conn.Exec(saveEnrichmentSQL, bookID, quality, flags,
+		"epub", "epub", time.Now().UTC())
+	return err
+}
+
+// GetEnrichment returns a book's quality record, or nil when it has never
+// been scored.
+func (db *DB) GetEnrichment(bookID int) (*Enrichment, error) {
+	var e Enrichment
+	var locked int
+	var lastChecked sql.NullTime
+	err := db.conn.QueryRow(`
+		SELECT book_id, quality, review_flags, meta_source, cover_source, locked, last_checked
+		FROM book_enrichment WHERE book_id = ?`, bookID).
+		Scan(&e.BookID, &e.Quality, &e.ReviewFlags, &e.MetaSource, &e.CoverSource,
+			&locked, &lastChecked)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	e.Locked = locked == 1
+	if lastChecked.Valid {
+		e.LastChecked = lastChecked.Time
+	}
+	return &e, nil
 }
