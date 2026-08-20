@@ -152,7 +152,6 @@ Admin-protected:
 - `POST /api/admin/enrich/stop`
 - `GET /api/admin/enrich/status`
 - `GET /api/admin/enrich/proposals`
-- `GET /api/admin/review`
 
 Sessions are held in memory with a 12-hour TTL and delivered as an `HttpOnly` cookie.
 They do not survive a server restart.
@@ -198,6 +197,11 @@ directory tree.
 online for books whose covers are missing or below bookstore quality. It is
 dry-run by default like enrichment, only replaces a cover when the replacement
 is clearly better, and writes to the cover cache rather than to EPUB files.
+
+`GET /api/admin/quality` reports library-wide health; `GET /api/admin/quality/queue`
+returns the worst-scoring books first. The **Metadata Review** button in the web
+UI (admin only) presents the same queue with per-book Edit, Cover, Resolve and
+Lock actions, plus the enrichment and cover-upgrade controls.
 
 ## UI Notes
 

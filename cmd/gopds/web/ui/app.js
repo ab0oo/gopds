@@ -16,7 +16,26 @@ const FIELDS = [
     { key: 'description', label: 'Description', type: 'textarea' }
 ];
 
+// Self-contained placeholder for books with no cover art. Inlined as a data
+// URI so the grid never depends on a third-party image host being reachable.
+const COVER_PLACEHOLDER = 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 300">' +
+    '<rect width="200" height="300" fill="#212c36"/>' +
+    '<rect x="0.5" y="0.5" width="199" height="299" fill="none" stroke="#2f3d49"/>' +
+    '<path d="M100 118a20 20 0 1 1 0 40 20 20 0 0 1 0-40zm0 8a12 12 0 1 0 0 24 12 12 0 0 0 0-24z" fill="#3d4c5a"/>' +
+    '<rect x="52" y="176" width="96" height="7" rx="3.5" fill="#3d4c5a"/>' +
+    '<rect x="68" y="192" width="64" height="7" rx="3.5" fill="#33414e"/>' +
+    '<text x="100" y="232" font-family="Segoe UI,Roboto,Helvetica,Arial,sans-serif" ' +
+    'font-size="13" fill="#6b7d8c" text-anchor="middle">No Cover</text></svg>'
+);
+
+// Trailing "Series Name Book 3" marker used to group a series in the grid.
+const SERIES_NAMED_RE = /\s*[\(\[]\s*([^)\]]*?)[,\s]+(?:#|book\s*|vol\.?\s*|part\s*)\s*(\d+(?:\.\d+)?)\s*[\)\]]\s*$/i;
+
 const App = {
+    COVER_PLACEHOLDER,
+    groupSeries: true,
+    expandedSeries: {},
     allBooks: [],
     filteredBooks: [],
     currentIndex: 0,
@@ -33,6 +52,11 @@ const App = {
     filterAuthor: '__all',
     filterCategory: '__all',
     filterSubcategory: '__all',
+    reviewItems: [],
+    reviewPage: 1,
+    reviewTotal: 0,
+    reviewFlag: '',
+    enrichPollTimer: null,
     auth: {
         authenticated: false,
         username: ''
@@ -48,13 +72,16 @@ const App = {
         rebuildBtn: document.getElementById('rebuild-btn'),
         rebuildStatus: document.getElementById('rebuild-status'),
         authBtn: document.getElementById('auth-btn'),
-        authStatus: document.getElementById('auth-status')
+        authStatus: document.getElementById('auth-status'),
+        reviewBtn: document.getElementById('review-btn'),
+        groupSeriesToggle: document.getElementById('group-series')
     },
 
     async init() {
         this.createModal();
         this.createInfoModal();
         this.createCoverModal();
+        this.createReviewModal();
         this.bindEvents();
         await this.syncAuthStatus();
         await this.fetchLibrary();
@@ -139,6 +166,12 @@ const App = {
         this.ui.rescanBtn.addEventListener('click', () => this.handleRescanClick());
         this.ui.rebuildBtn.addEventListener('click', () => this.handleRebuildClick());
         this.ui.authBtn.addEventListener('click', () => this.handleAuthClick());
+        this.ui.reviewBtn.addEventListener('click', () => this.openReviewModal());
+        this.ui.groupSeriesToggle.addEventListener('change', (e) => {
+            this.groupSeries = e.target.checked;
+            this.expandedSeries = {};
+            this.render(true);
+        });
 
         this.ui.library.addEventListener('click', (e) => this.handleLibraryClick(e));
 
@@ -376,12 +409,14 @@ const App = {
             this.ui.authStatus.textContent = `Logged in as ${this.auth.username || 'admin'}.`;
             this.ui.rescanBtn.classList.remove('hidden');
             this.ui.rebuildBtn.classList.remove('hidden');
+            this.ui.reviewBtn.classList.remove('hidden');
             return;
         }
         this.ui.authBtn.textContent = 'Admin Login';
         this.ui.authStatus.textContent = 'Read-only mode.';
         this.ui.rescanBtn.classList.add('hidden');
         this.ui.rebuildBtn.classList.add('hidden');
+        this.ui.reviewBtn.classList.add('hidden');
         this.ui.rebuildStatus.textContent = '';
     },
 
@@ -653,6 +688,14 @@ const App = {
     },
 
     handleLibraryClick(e) {
+        const seriesToggle = e.target.closest('[data-series-toggle]');
+        if (seriesToggle) {
+            const key = seriesToggle.dataset.seriesToggle;
+            this.expandedSeries[key] = !this.expandedSeries[key];
+            this.render(true);
+            return;
+        }
+
         const infoButton = e.target.closest('.book-info');
         if (infoButton) {
             const id = Number(infoButton.dataset.bookId);
@@ -1167,34 +1210,500 @@ const App = {
             this.ui.library.innerHTML = '';
         }
 
-        const nextBatch = this.filteredBooks.slice(this.currentIndex, this.currentIndex + this.itemsPerPage);
+        const entries = this.displayEntries();
+        const nextBatch = entries.slice(this.currentIndex, this.currentIndex + this.itemsPerPage);
         const fragment = document.createDocumentFragment();
 
-        nextBatch.forEach((book) => {
-            const el = document.createElement('div');
-            el.className = 'book';
-            const coverV = this.coverVersion[book.id] || 0;
-            el.innerHTML = `
-                <a href="/download/${book.id}">
-                    <img src="/covers/${book.id}.jpg?v=${coverV}"
-                         alt="${this.escapeHTML(book.title || '')}"
-                         loading="lazy"
-                         onerror="this.src='https://via.placeholder.com/150x220?text=No+Cover'">
-                </a>
-                <span class="book-title">${this.escapeHTML(book.title || '')}</span>
-                <small>${this.escapeHTML(book.author || '')}</small>
-                <div class="book-actions">
-                    <a class="book-download" href="/download/${book.id}">Download</a>
-                    <button type="button" class="book-info" data-book-id="${book.id}">Book Info</button>
-                    ${this.auth.authenticated ? `<button type="button" class="edit-toggle" data-book-id="${book.id}">Edit Metadata</button>` : ''}
-                    ${this.auth.authenticated ? `<button type="button" class="change-cover" data-book-id="${book.id}">Change Cover</button>` : ''}
-                </div>
-            `;
-            fragment.appendChild(el);
+        nextBatch.forEach((entry) => {
+            fragment.appendChild(entry.series
+                ? this.buildSeriesCard(entry)
+                : this.buildBookCard(entry.book));
         });
 
         this.ui.library.appendChild(fragment);
         this.currentIndex += this.itemsPerPage;
+
+        if (!entries.length) {
+            this.ui.library.innerHTML =
+                '<div class="library-empty">No books match the current filters.</div>';
+        }
+    },
+
+    // displayEntries collapses multi-book series into a single card so a long
+    // series reads as one shelf entry instead of a dozen near-identical covers.
+    // A series the user has expanded renders its volumes inline.
+    displayEntries() {
+        if (!this.groupSeries) {
+            return this.filteredBooks.map((book) => ({ book }));
+        }
+
+        const groups = new Map();
+        const entries = [];
+
+        this.filteredBooks.forEach((book) => {
+            const info = this.seriesInfo(book);
+            if (!info) {
+                entries.push({ book });
+                return;
+            }
+            const key = `${(book.author || '').toLowerCase()}|${info.name.toLowerCase()}`;
+            if (!groups.has(key)) {
+                const group = { series: info.name, author: book.author, books: [], key };
+                groups.set(key, group);
+                entries.push(group);
+            }
+            groups.get(key).books.push({ book, index: info.index });
+        });
+
+        // A "series" of one is just a book.
+        const flattened = [];
+        entries.forEach((entry) => {
+            if (!entry.series) {
+                flattened.push(entry);
+                return;
+            }
+            if (entry.books.length < 2) {
+                flattened.push({ book: entry.books[0].book });
+                return;
+            }
+            entry.books.sort((a, b) => (Number(a.index) || 0) - (Number(b.index) || 0));
+            flattened.push(entry);
+            if (this.expandedSeries[entry.key]) {
+                entry.books.forEach((b) => flattened.push({ book: b.book, inSeries: true }));
+            }
+        });
+        return flattened;
+    },
+
+    // seriesInfo reads the structured series fields the scanner extracts.
+    // Falls back to parsing the title for books indexed before series columns
+    // existed, so an un-rescanned library still groups correctly.
+    seriesInfo(book) {
+        const name = String(book.series || '').trim();
+        if (name) {
+            return { name, index: this.formatSeriesIndex(book.series_index) };
+        }
+        const named = SERIES_NAMED_RE.exec(String(book.title || ''));
+        if (named && named[1] && !/\d/.test(named[1])) {
+            return { name: named[1].trim(), index: named[2] };
+        }
+        return null;
+    },
+
+    // Calibre stores series positions as floats ("1.0"); show "1" but keep
+    // genuine half-numbers like "2.5" that mark novellas.
+    formatSeriesIndex(raw) {
+        const v = String(raw || '').trim();
+        if (!v) {
+            return '';
+        }
+        const n = Number(v);
+        return Number.isFinite(n) ? String(n) : v;
+    },
+
+    buildBookCard(book) {
+        const el = document.createElement('div');
+        el.className = 'book';
+        const coverV = this.coverVersion[book.id] || 0;
+        const info = this.seriesInfo(book);
+        const badge = info
+            ? `<span class="series-badge" title="${this.escapeHTML(info.name)}">${this.escapeHTML(info.name)}${info.index ? ' #' + this.escapeHTML(info.index) : ''}</span>`
+            : '';
+        el.innerHTML = `
+            <a href="/download/${book.id}">
+                <img src="/covers/${book.id}.jpg?v=${coverV}"
+                     alt="${this.escapeHTML(book.title || '')}"
+                     loading="lazy"
+                     onerror="this.onerror=null;this.src=App.COVER_PLACEHOLDER;this.classList.add('cover-missing')">
+            </a>
+            <span class="book-title">${this.escapeHTML(book.title || '')}</span>
+            <small>${this.escapeHTML(book.author || '')}</small>
+            ${badge}
+            <div class="book-actions">
+                <a class="book-download" href="/download/${book.id}">Download</a>
+                <button type="button" class="book-info" data-book-id="${book.id}">Book Info</button>
+                ${this.auth.authenticated ? `<button type="button" class="edit-toggle" data-book-id="${book.id}">Edit Metadata</button>` : ''}
+                ${this.auth.authenticated ? `<button type="button" class="change-cover" data-book-id="${book.id}">Change Cover</button>` : ''}
+            </div>
+        `;
+        return el;
+    },
+
+    buildSeriesCard(group) {
+        const el = document.createElement('div');
+        el.className = 'book book-series';
+        const expanded = Boolean(this.expandedSeries[group.key]);
+        const covers = group.books.slice(0, 3).map((b, i) => {
+            const v = this.coverVersion[b.book.id] || 0;
+            return `<img class="series-cover series-cover-${i}" src="/covers/${b.book.id}.jpg?v=${v}"
+                        alt="" loading="lazy"
+                        onerror="this.onerror=null;this.src=App.COVER_PLACEHOLDER">`;
+        }).join('');
+
+        el.innerHTML = `
+            <div class="series-stack" data-series-toggle="${this.escapeHTML(group.key)}">
+                ${covers}
+                <span class="series-count">${group.books.length}</span>
+            </div>
+            <span class="book-title">${this.escapeHTML(group.series)}</span>
+            <small>${this.escapeHTML(group.author || '')}</small>
+            <span class="series-badge">${group.books.length} books</span>
+            <div class="book-actions">
+                <button type="button" class="series-expand" data-series-toggle="${this.escapeHTML(group.key)}">
+                    ${expanded ? 'Collapse' : 'Show all'}
+                </button>
+            </div>
+        `;
+        return el;
+    },
+
+    createReviewModal() {
+        const modal = document.createElement('div');
+        modal.id = 'review-modal';
+        modal.className = 'modal hidden';
+        modal.innerHTML = `
+            <div class="modal-backdrop" data-close-review="1"></div>
+            <div class="modal-dialog review-dialog" role="dialog" aria-modal="true" aria-label="Metadata review queue">
+                <div class="modal-header">
+                    <h2>Metadata Review</h2>
+                    <button type="button" id="review-close" class="modal-close" aria-label="Close">&times;</button>
+                </div>
+                <div class="review-summary" id="review-summary">Loading library quality...</div>
+                <div class="review-controls">
+                    <select id="review-flag" aria-label="Filter by issue">
+                        <option value="">All issues</option>
+                    </select>
+                    <button type="button" id="review-enrich" title="Look up missing metadata online (dry run)">Dry-run Enrich</button>
+                    <button type="button" id="review-enrich-apply" title="Apply high-confidence matches">Apply Enrich</button>
+                    <button type="button" id="review-covers" title="Find better cover art online (dry run)">Dry-run Covers</button>
+                    <button type="button" id="review-covers-apply" title="Replace low-quality covers with better online art">Upgrade Covers</button>
+                    <span class="edit-status" id="review-enrich-status"></span>
+                </div>
+                <div id="review-list" class="review-list"></div>
+                <div class="review-pager">
+                    <button type="button" id="review-prev">Previous</button>
+                    <span id="review-page-label"></span>
+                    <button type="button" id="review-next">Next</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        this.ui.reviewModal = modal;
+        this.ui.reviewClose = modal.querySelector('#review-close');
+        this.ui.reviewSummary = modal.querySelector('#review-summary');
+        this.ui.reviewFlag = modal.querySelector('#review-flag');
+        this.ui.reviewList = modal.querySelector('#review-list');
+        this.ui.reviewPrev = modal.querySelector('#review-prev');
+        this.ui.reviewNext = modal.querySelector('#review-next');
+        this.ui.reviewPageLabel = modal.querySelector('#review-page-label');
+        this.ui.reviewEnrich = modal.querySelector('#review-enrich');
+        this.ui.reviewEnrichApply = modal.querySelector('#review-enrich-apply');
+        this.ui.reviewEnrichStatus = modal.querySelector('#review-enrich-status');
+        this.ui.reviewCovers = modal.querySelector('#review-covers');
+        this.ui.reviewCoversApply = modal.querySelector('#review-covers-apply');
+
+        this.ui.reviewClose.addEventListener('click', () => this.closeReviewModal());
+        modal.addEventListener('click', (e) => {
+            if (e.target.dataset.closeReview === '1') {
+                this.closeReviewModal();
+            }
+        });
+        this.ui.reviewFlag.addEventListener('change', (e) => {
+            this.reviewFlag = e.target.value;
+            this.reviewPage = 1;
+            this.loadReviewQueue();
+        });
+        this.ui.reviewPrev.addEventListener('click', () => {
+            if (this.reviewPage > 1) {
+                this.reviewPage -= 1;
+                this.loadReviewQueue();
+            }
+        });
+        this.ui.reviewNext.addEventListener('click', () => {
+            if (this.reviewPage * 25 < this.reviewTotal) {
+                this.reviewPage += 1;
+                this.loadReviewQueue();
+            }
+        });
+        this.ui.reviewEnrich.addEventListener('click', () => this.startEnrichment(false));
+        this.ui.reviewEnrichApply.addEventListener('click', () => this.startEnrichment(true));
+        this.ui.reviewCovers.addEventListener('click', () => this.upgradeCovers(false));
+        this.ui.reviewCoversApply.addEventListener('click', () => this.upgradeCovers(true));
+        this.ui.reviewList.addEventListener('click', (e) => this.handleReviewListClick(e));
+    },
+
+    async openReviewModal() {
+        if (!this.auth.authenticated) {
+            return;
+        }
+        this.ui.reviewModal.classList.remove('hidden');
+        this.reviewPage = 1;
+        await Promise.all([this.loadQualitySummary(), this.loadReviewQueue()]);
+        await this.syncEnrichStatus();
+    },
+
+    closeReviewModal() {
+        this.ui.reviewModal.classList.add('hidden');
+        this.stopEnrichPolling();
+    },
+
+    async loadQualitySummary() {
+        try {
+            const response = await fetch('/api/admin/quality');
+            if (!response.ok) {
+                this.ui.reviewSummary.textContent = 'Quality summary unavailable.';
+                return;
+            }
+            const s = await response.json();
+            const avg = Math.round(s.avg_quality || 0);
+            this.ui.reviewSummary.textContent =
+                `${s.total} books | average quality ${avg}/100 | ${s.needs_review} need review | ${s.locked} locked`;
+
+            const flags = Object.entries(s.flag_counts || {})
+                .sort((a, b) => b[1] - a[1]);
+            const current = this.reviewFlag;
+            this.ui.reviewFlag.innerHTML =
+                ['<option value="">All issues</option>']
+                    .concat(flags.map(([k, v]) =>
+                        `<option value="${this.escapeHTML(k)}">${this.escapeHTML(k)} (${v})</option>`))
+                    .join('');
+            this.ui.reviewFlag.value = current;
+        } catch (err) {
+            console.error(err);
+            this.ui.reviewSummary.textContent = 'Quality summary unavailable.';
+        }
+    },
+
+    async loadReviewQueue() {
+        this.ui.reviewList.innerHTML = '<div class="review-empty">Loading...</div>';
+        try {
+            const params = new URLSearchParams({ page: String(this.reviewPage), limit: '25' });
+            if (this.reviewFlag) {
+                params.set('flag', this.reviewFlag);
+            }
+            const response = await fetch(`/api/admin/review?${params.toString()}`);
+            if (!response.ok) {
+                this.ui.reviewList.innerHTML = '<div class="review-empty">Failed to load review queue.</div>';
+                return;
+            }
+            const payload = await response.json();
+            this.reviewItems = payload.items || [];
+            this.reviewTotal = payload.total || 0;
+            this.renderReviewList();
+        } catch (err) {
+            console.error(err);
+            this.ui.reviewList.innerHTML = '<div class="review-empty">Failed to load review queue.</div>';
+        }
+    },
+
+    renderReviewList() {
+        if (!this.reviewItems.length) {
+            this.ui.reviewList.innerHTML = '<div class="review-empty">Nothing needs review here.</div>';
+            this.ui.reviewPageLabel.textContent = '';
+            return;
+        }
+
+        this.ui.reviewList.innerHTML = this.reviewItems.map((item) => {
+            const b = item.book;
+            const flags = String(item.review_flags || '')
+                .split(',')
+                .filter(Boolean)
+                .map((f) => `<span class="review-flag">${this.escapeHTML(f)}</span>`)
+                .join('');
+            return `
+                <div class="review-row" data-book-id="${b.id}">
+                    <img class="review-cover" src="/covers/${b.id}.jpg" alt=""
+                         loading="lazy" onerror="this.style.visibility='hidden'">
+                    <div class="review-meta">
+                        <div class="review-title">${this.escapeHTML(b.title || 'Untitled')}</div>
+                        <div class="review-author">${this.escapeHTML(b.author || 'Unknown Author')}</div>
+                        <div class="review-flags">${flags}</div>
+                    </div>
+                    <div class="review-score" title="Metadata quality score">${item.quality}</div>
+                    <div class="review-actions">
+                        <button type="button" data-review-edit="${b.id}">Edit</button>
+                        <button type="button" data-review-cover="${b.id}">Cover</button>
+                        <button type="button" data-review-resolve="${b.id}">Resolve</button>
+                        <button type="button" data-review-lock="${b.id}" title="Resolve and never auto-touch this book">Lock</button>
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+        const start = (this.reviewPage - 1) * 25 + 1;
+        const end = Math.min(this.reviewPage * 25, this.reviewTotal);
+        this.ui.reviewPageLabel.textContent = `${start}-${end} of ${this.reviewTotal}`;
+    },
+
+    async handleReviewListClick(e) {
+        const target = e.target.closest('button');
+        if (!target) {
+            return;
+        }
+
+        const editId = target.dataset.reviewEdit;
+        const coverId = target.dataset.reviewCover;
+        const resolveId = target.dataset.reviewResolve;
+        const lockId = target.dataset.reviewLock;
+
+        if (editId) {
+            const book = this.findBookById(editId);
+            if (book) {
+                this.closeReviewModal();
+                this.openModal(book);
+            }
+            return;
+        }
+        if (coverId) {
+            const book = this.findBookById(coverId);
+            if (book) {
+                this.closeReviewModal();
+                this.openCoverModal(book);
+            }
+            return;
+        }
+        if (resolveId || lockId) {
+            const id = resolveId || lockId;
+            const locked = Boolean(lockId);
+            target.disabled = true;
+            try {
+                const response = await fetch(`/api/admin/review/${id}/resolve`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ locked })
+                });
+                if (!response.ok) {
+                    throw new Error(await response.text());
+                }
+                await Promise.all([this.loadQualitySummary(), this.loadReviewQueue()]);
+            } catch (err) {
+                console.error(err);
+                target.disabled = false;
+            }
+        }
+    },
+
+    findBookById(id) {
+        const numeric = Number(id);
+        return this.allBooks.find((b) => b.id === numeric)
+            || (this.reviewItems.find((i) => i.book.id === numeric) || {}).book;
+    },
+
+    async startEnrichment(apply) {
+        if (apply && !window.confirm(
+            'Apply high-confidence metadata to the database cache?\n\n' +
+            'Only exact matches are applied, and only to empty fields. ' +
+            'EPUB files are not modified.')) {
+            return;
+        }
+
+        this.ui.reviewEnrichStatus.textContent = apply ? 'Starting apply...' : 'Starting dry run...';
+        try {
+            const response = await fetch(`/api/admin/enrich?apply=${apply}&limit=200`, { method: 'POST' });
+            if (!response.ok) {
+                throw new Error(await response.text());
+            }
+            this.applyEnrichStatus(await response.json());
+            this.startEnrichPolling();
+        } catch (err) {
+            console.error(err);
+            this.ui.reviewEnrichStatus.textContent = `Enrichment failed: ${err.message}`;
+        }
+    },
+
+    async upgradeCovers(apply) {
+        if (apply && !window.confirm(
+            'Replace low-quality covers with better artwork found online?\n\n' +
+            'Only covers that are clearly an improvement are replaced. ' +
+            'This updates the cover cache, not your EPUB files.')) {
+            return;
+        }
+
+        const buttons = [this.ui.reviewCovers, this.ui.reviewCoversApply];
+        buttons.forEach((b) => { b.disabled = true; });
+        this.ui.reviewEnrichStatus.textContent = apply
+            ? 'Upgrading covers (this takes a moment)...'
+            : 'Checking for better covers...';
+
+        try {
+            const response = await fetch(`/api/admin/covers/upgrade?apply=${apply}&limit=25`, { method: 'POST' });
+            if (!response.ok) {
+                throw new Error(await response.text());
+            }
+            const payload = await response.json();
+            const verb = payload.dry_run ? 'could upgrade' : 'upgraded';
+            const count = payload.dry_run
+                ? payload.results.filter((r) => !r.rejected).length
+                : payload.applied;
+            this.ui.reviewEnrichStatus.textContent =
+                `Covers: ${verb} ${count} of ${payload.examined} examined.`;
+            if (!payload.dry_run && payload.applied > 0) {
+                payload.results.filter((r) => r.applied).forEach((r) => {
+                    this.coverVersion[r.book_id] = (this.coverVersion[r.book_id] || 0) + 1;
+                });
+                this.render(true);
+                this.loadQualitySummary();
+            }
+        } catch (err) {
+            console.error(err);
+            this.ui.reviewEnrichStatus.textContent = `Cover upgrade failed: ${err.message}`;
+        } finally {
+            buttons.forEach((b) => { b.disabled = false; });
+        }
+    },
+
+    async syncEnrichStatus() {
+        try {
+            const response = await fetch('/api/admin/enrich/status');
+            if (!response.ok) {
+                return;
+            }
+            const status = await response.json();
+            this.applyEnrichStatus(status);
+            if (status.running) {
+                this.startEnrichPolling();
+            }
+        } catch (err) {
+            console.error(err);
+        }
+    },
+
+    applyEnrichStatus(status) {
+        if (!status || !status.phase) {
+            this.ui.reviewEnrichStatus.textContent = '';
+            return;
+        }
+        const mode = status.dry_run ? 'dry run' : 'apply';
+        if (status.running) {
+            this.ui.reviewEnrichStatus.textContent =
+                `${mode}: ${status.processed}/${status.total} | applied ${status.applied} | review ${status.queued_for_review}`;
+            return;
+        }
+        this.stopEnrichPolling();
+        if (status.error) {
+            this.ui.reviewEnrichStatus.textContent = `Failed: ${status.error}`;
+            return;
+        }
+        if (status.phase === 'complete') {
+            const verb = status.dry_run ? 'would update' : 'updated';
+            this.ui.reviewEnrichStatus.textContent =
+                `${mode} complete: ${verb} ${status.applied}, ${status.queued_for_review} queued, ${status.no_match} no match`;
+            this.loadQualitySummary();
+            this.loadReviewQueue();
+        }
+    },
+
+    startEnrichPolling() {
+        this.stopEnrichPolling();
+        this.enrichPollTimer = window.setInterval(() => this.syncEnrichStatus(), 2000);
+    },
+
+    stopEnrichPolling() {
+        if (this.enrichPollTimer) {
+            window.clearInterval(this.enrichPollTimer);
+            this.enrichPollTimer = null;
+        }
     },
 
     escapeHTML(value) {
