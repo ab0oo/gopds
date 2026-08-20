@@ -122,3 +122,18 @@ func TestTitlePreservesSubtitleParens(t *testing.T) {
 		t.Errorf("Title(%q) = %q, want unchanged", in, got)
 	}
 }
+
+func TestSeriesNameRejectsGenres(t *testing.T) {
+	// A genre label in calibre:series would group unrelated books together.
+	for _, in := range []string{"Horror", "Fantasy", "Science Fiction", "Mystery"} {
+		if got := Title("Some Book", in, "1").Series; got != "" {
+			t.Errorf("Title series for %q = %q, want empty", in, got)
+		}
+	}
+	// Real series names survive, including ones containing a genre word.
+	for _, in := range []string{"Discworld", "Jack Reacher", "Hercule Poirot Mystery"} {
+		if got := Title("Some Book", in, "1").Series; got != in {
+			t.Errorf("Title series for %q = %q, want unchanged", in, got)
+		}
+	}
+}

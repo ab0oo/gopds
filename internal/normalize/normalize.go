@@ -217,7 +217,7 @@ func Title(raw, existingSeries, existingIndex string) TitleResult {
 
 	res := TitleResult{
 		Title:       collapseSpace(original),
-		Series:      collapseSpace(existingSeries),
+		Series:      sanitizeSeriesName(existingSeries),
 		SeriesIndex: strings.TrimSpace(existingIndex),
 	}
 
@@ -254,4 +254,18 @@ func Title(raw, existingSeries, existingIndex string) TitleResult {
 		res.Series != strings.TrimSpace(existingSeries) ||
 		res.SeriesIndex != strings.TrimSpace(existingIndex)
 	return res
+}
+
+// sanitizeSeriesName rejects series values that are really genre labels.
+// Some EPUBs put "Horror" or "Fantasy" in calibre:series, which would render
+// as a nonsense series card grouping unrelated books together.
+func sanitizeSeriesName(raw string) string {
+	name := collapseSpace(raw)
+	if name == "" {
+		return ""
+	}
+	if CanonicalGenre(name) != "" && len(strings.Fields(name)) <= 2 {
+		return ""
+	}
+	return name
 }

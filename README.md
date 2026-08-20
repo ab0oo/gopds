@@ -56,7 +56,9 @@ The server listens on port `8880` by default (see `LISTEN_ADDR`).
 - `path` — derived from directory layout under `BOOK_PATH`:
   - category = first folder under `BOOK_PATH`
   - subcategory = second folder under `BOOK_PATH` (optional)
-- `subject` — derived from the EPUB's `dc:subject` metadata.
+- `subject` — derived from the EPUB's `dc:subject` metadata. Hierarchical subjects
+  (`Fiction > Science Fiction`, `Fiction/Science Fiction`) are split into category and
+  subcategory; otherwise the first two subjects are used.
 - `auto` — try `subject` first, fall back to `path` when the EPUB has no usable subjects.
 - `none` — no categories. The "Browse by Category" entry is omitted from the OPDS root.
 
