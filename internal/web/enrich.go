@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -487,4 +488,182 @@ func (s *Server) HandleReviewLock(w http.ResponseWriter, r *http.Request) {
 		BookID int  `json:"book_id"`
 		Locked bool `json:"locked"`
 	}{OK: true, BookID: bookID, Locked: req.Locked})
+}
+
+// coverUpgradeResult reports what a cover upgrade pass did for one book.
+type coverUpgradeResult struct {
+	BookID   int    `json:"book_id"`
+	Title    string `json:"title"`
+	OldSize  string `json:"old_size"`
+	NewSize  string `json:"new_size"`
+	Source   string `json:"source"`
+	Applied  bool   `json:"applied"`
+	Rejected string `json:"rejected,omitempty"`
+}
+
+// HandleCoverUpgrade finds better artwork online for books whose covers are
+// missing or below bookstore quality.
+//
+// Like metadata enrichment this is dry-run by default, and it only ever
+// replaces a cover with a strictly better one: a candidate that is not clearly
+// an improvement is rejected rather than swapped in.
+func (s *Server) HandleCoverUpgrade(w http.ResponseWriter, r *http.Request) {
+	apply := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("apply")), "true")
+	limit := parseIntDefault(r.URL.Query().Get("limit"), 25)
+	if limit < 1 {
+		limit = 25
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	items, _, err := s.db.GetReviewQueue("", 500, 0)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	results := make([]coverUpgradeResult, 0, limit)
+
+	for _, item := range items {
+		if len(results) >= limit {
+			break
+		}
+		flags := "," + item.ReviewFlags + ","
+		if !strings.Contains(flags, ","+normalize.ReviewThinCover+",") &&
+			!strings.Contains(flags, ","+normalize.ReviewNoCover+",") &&
+			!strings.Contains(flags, ","+normalize.ReviewBadCover+",") {
+			continue
+		}
+
+		res := s.upgradeOneCover(client, item.Book, apply)
+		if res != nil {
+			results = append(results, *res)
+		}
+		time.Sleep(enrichDefaultRateLimit)
+	}
+
+	applied := 0
+	for _, r := range results {
+		if r.Applied {
+			applied++
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		DryRun   bool                 `json:"dry_run"`
+		Examined int                  `json:"examined"`
+		Applied  int                  `json:"applied"`
+		Results  []coverUpgradeResult `json:"results"`
+	}{DryRun: !apply, Examined: len(results), Applied: applied, Results: results})
+}
+
+func (s *Server) upgradeOneCover(client *http.Client, book database.Book, apply bool) *coverUpgradeResult {
+	out := &coverUpgradeResult{BookID: book.ID, Title: book.Title}
+
+	curW, curH := normalize.CoverDimensions(fmt.Sprintf("./data/covers/%d.jpg", book.ID))
+	out.OldSize = fmt.Sprintf("%dx%d", curW, curH)
+	curScore := normalize.CoverScore("cover.jpg", curW, curH)
+
+	bookPath, err := s.resolveBookPath(&book)
+	if err != nil {
+		out.Rejected = "book file not found"
+		return out
+	}
+	live, _ := scanner.ExtractLiveMetadata(bookPath)
+
+	title, author, isbn := book.Title, book.Author, ""
+	if live != nil {
+		if strings.TrimSpace(live.Title) != "" {
+			title = live.Title
+		}
+		if strings.TrimSpace(live.Author) != "" {
+			author = live.Author
+		}
+		isbn = scanner.ISBNFromString(live.Identifier)
+	}
+
+	candidates := s.gatherOnlineCovers(client, book.ID, title, author, isbn)
+	if len(candidates) == 0 {
+		out.Rejected = "no online candidates"
+		return out
+	}
+
+	best := candidates[0]
+	bestScore := normalize.CoverScore("cover.jpg", best.Width, best.Height)
+	out.NewSize = fmt.Sprintf("%dx%d", best.Width, best.Height)
+	out.Source = best.Source
+
+	// Require a clear improvement, not a lateral move.
+	if bestScore <= curScore*11/10 {
+		out.Rejected = "no clear improvement"
+		return out
+	}
+
+	if !apply {
+		return out
+	}
+
+	raw, err := fetchAllowedRemoteImage(best.ImageURL)
+	if err != nil {
+		out.Rejected = fmt.Sprintf("fetch failed: %v", err)
+		return out
+	}
+	jpg, err := scanner.ConvertImageToJPEG(raw)
+	if err != nil {
+		out.Rejected = fmt.Sprintf("convert failed: %v", err)
+		return out
+	}
+	if err := os.MkdirAll("./data/covers", 0755); err != nil {
+		out.Rejected = "cache dir unavailable"
+		return out
+	}
+	if err := os.WriteFile(fmt.Sprintf("./data/covers/%d.jpg", book.ID), jpg, 0644); err != nil {
+		out.Rejected = "cache write failed"
+		return out
+	}
+
+	out.Applied = true
+	return out
+}
+
+// gatherOnlineCovers reuses the interactive cover search, returning candidates
+// already filtered and ranked by the existing online-cover pipeline.
+func (s *Server) gatherOnlineCovers(client *http.Client, bookID int, title, author, isbn string) []coverCandidate {
+	candidates := make([]coverCandidate, 0, 8)
+	seen := map[string]struct{}{}
+
+	if isbn != "" {
+		ol := fmt.Sprintf("https://covers.openlibrary.org/b/isbn/%s-L.jpg?default=false", url.PathEscape(isbn))
+		if remoteImageReachable(client, ol) {
+			candidates = append(candidates, makeRemoteCoverCandidate(ol, "Open Library ISBN "+isbn, "openlibrary"))
+			seen[ol] = struct{}{}
+		}
+	}
+
+	query := strings.TrimSpace(title + " " + author)
+	if query != "" {
+		if gb, err := fetchGoogleBookCoverCandidates(client, query, isbn, 6); err == nil {
+			for _, c := range gb {
+				if _, dup := seen[c.ImageURL]; dup {
+					continue
+				}
+				seen[c.ImageURL] = struct{}{}
+				candidates = append(candidates, c)
+			}
+		}
+		if ol, err := fetchOpenLibrarySearchCoverCandidates(client, query, 6); err == nil {
+			for _, c := range ol {
+				if _, dup := seen[c.ImageURL]; dup {
+					continue
+				}
+				seen[c.ImageURL] = struct{}{}
+				candidates = append(candidates, c)
+			}
+		}
+	}
+
+	return rankAndFilterOnlineCovers(client, candidates)
 }

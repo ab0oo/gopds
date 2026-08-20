@@ -145,6 +145,7 @@ Admin-protected:
 - `GET /api/admin/rebuild/status`
 - `GET /api/admin/quality`
 - `GET /api/admin/quality/queue`
+- `POST /api/admin/covers/upgrade`
 - `POST /api/admin/enrich`
 - `POST /api/admin/enrich/stop`
 - `GET /api/admin/enrich/status`
@@ -182,6 +183,19 @@ Library and Google Books. It is deliberately conservative:
 - **Database only.** The automated pass does not modify EPUB files.
 - **Locked books are skipped**, so manual edits are never clobbered.
 - Rate-limited to one upstream request per second (`ENRICH_RATE_MS` to adjust).
+
+**Cover selection** picks the best artwork an EPUB actually contains, judged on
+shape and resolution rather than filename order. Book covers are portrait and
+roughly 2:3, so landscape and square images are rejected outright -- this is what
+stops a large publisher logo from being chosen over the real cover. A sibling
+`cover.jpg` next to the EPUB is used only when it beats the embedded artwork,
+since those files are often one shared image copied across an author's whole
+directory tree.
+
+**Cover upgrade** (`POST /api/admin/covers/upgrade`) looks for better artwork
+online for books whose covers are missing or below bookstore quality. It is
+dry-run by default like enrichment, only replaces a cover when the replacement
+is clearly better, and writes to the cover cache rather than to EPUB files.
 
 ## UI Notes
 

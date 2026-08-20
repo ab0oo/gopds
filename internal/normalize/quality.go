@@ -38,6 +38,7 @@ type QualityInput struct {
 	Identifier  string
 	Series      string
 	SeriesIndex string
+	CoverName   string
 	CoverWidth  int
 	CoverHeight int
 	AuthorFlag  string
@@ -57,6 +58,7 @@ const (
 	ReviewNoCover       = "no_cover"
 	ReviewNoCategory    = "no_category"
 	ReviewNoIdentifier  = "no_identifier"
+	ReviewBadCover      = "bad_cover"
 )
 
 // Score rates a book 0-100 on metadata completeness. It is a pure function so
@@ -71,15 +73,20 @@ func Score(in QualityInput) QualityResult {
 		res.Flags = append(res.Flags, ReviewNoDescription)
 	}
 
-	switch {
-	case in.CoverWidth <= 0 || in.CoverHeight <= 0:
-		res.Flags = append(res.Flags, ReviewNoCover)
-	case in.CoverWidth < MinCoverWidth || in.CoverHeight < MinCoverHeight:
-		res.Flags = append(res.Flags, ReviewThinCover)
-	case in.CoverWidth >= GoodCoverWidth:
+	switch AssessCover(in.CoverName, in.CoverWidth, in.CoverHeight) {
+	case CoverGood:
 		res.Score += WeightCover
-	default:
+	case CoverAcceptable:
+		// Legible but not bookstore quality: half credit, and flag it so the
+		// review queue can offer an online upgrade.
 		res.Score += WeightCover / 2
+		res.Flags = append(res.Flags, ReviewThinCover)
+	default:
+		if in.CoverWidth <= 0 || in.CoverHeight <= 0 {
+			res.Flags = append(res.Flags, ReviewNoCover)
+		} else {
+			res.Flags = append(res.Flags, ReviewBadCover)
+		}
 	}
 
 	if strings.TrimSpace(in.Author) != "" && in.AuthorFlag == "" {

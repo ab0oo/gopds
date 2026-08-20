@@ -693,6 +693,7 @@ func (s *Scanner) Start(root string) error {
 			Identifier:  identifierFromOPF(meta),
 			Series:      titleRes.Series,
 			SeriesIndex: titleRes.SeriesIndex,
+			CoverName:   "cover.jpg",
 			CoverWidth:  cw,
 			CoverHeight: ch,
 			AuthorFlag:  authorRes.Flag,
@@ -836,16 +837,38 @@ func normalizeSubjectList(values []string) []string {
 }
 
 func SaveCover(epubPath string, bookID int) error {
-	localCoverPath := filepath.Join(filepath.Dir(epubPath), "cover.jpg")
-	if info, err := os.Stat(localCoverPath); err == nil && !info.IsDir() {
-		return saveExternalCover(localCoverPath, bookID)
-	}
-
 	reader, err := zip.OpenReader(epubPath)
 	if err != nil {
 		return err
 	}
 	defer reader.Close()
+
+	// Pick the best artwork the EPUB actually contains, judged on shape and
+	// size rather than on filename order. A sibling cover.jpg is used only when
+	// it beats what is inside the book: those files are frequently a single
+	// shared image copied across an author's whole directory tree, and are
+	// often lower resolution than the real embedded cover.
+	best, bestScore := bestCoverInEPUB(reader.File)
+
+	localCoverPath := filepath.Join(filepath.Dir(epubPath), "cover.jpg")
+	if info, statErr := os.Stat(localCoverPath); statErr == nil && !info.IsDir() {
+		if raw, readErr := os.ReadFile(localCoverPath); readErr == nil {
+			if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(raw)); cfgErr == nil {
+				sibScore := normalize.CoverScore("cover.jpg", cfg.Width, cfg.Height)
+				if sibScore > 0 && sibScore >= bestScore {
+					return saveExternalCover(localCoverPath, bookID)
+				}
+			}
+		}
+		// Sibling exists but is unusable or worse; fall through to the EPUB.
+		if best == nil {
+			return saveExternalCover(localCoverPath, bookID)
+		}
+	}
+
+	if best != nil {
+		return extractZipFile(best, bookID)
+	}
 
 	for _, f := range reader.File {
 		if isPreferredCoverFilename(f.Name) {
@@ -1548,4 +1571,42 @@ func ISBNFromString(raw string) string {
 		return clean
 	}
 	return ""
+}
+
+// bestCoverInEPUB scans every image in the archive and returns the one that
+// best matches book-cover shape and size, along with its score. Returns nil
+// when the EPUB contains no usable artwork.
+func bestCoverInEPUB(files []*zip.File) (*zip.File, int) {
+	var best *zip.File
+	bestScore := 0
+
+	for _, f := range files {
+		low := strings.ToLower(f.Name)
+		if !strings.HasSuffix(low, ".jpg") && !strings.HasSuffix(low, ".jpeg") &&
+			!strings.HasSuffix(low, ".png") {
+			continue
+		}
+		// Skip obviously huge entries; decoding config is cheap but opening
+		// every asset in a large EPUB is not free.
+		if f.UncompressedSize64 > 25<<20 {
+			continue
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		cfg, _, err := image.DecodeConfig(rc)
+		rc.Close()
+		if err != nil {
+			continue
+		}
+
+		score := normalize.CoverScore(f.Name, cfg.Width, cfg.Height)
+		if score > bestScore {
+			bestScore = score
+			best = f
+		}
+	}
+	return best, bestScore
 }
