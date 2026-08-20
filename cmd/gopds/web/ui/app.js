@@ -53,6 +53,7 @@ const App = {
     filterCategory: '__all',
     filterSubcategory: '__all',
     reviewItems: [],
+    returnToReview: false,
     reviewPage: 1,
     reviewTotal: 0,
     reviewFlag: '',
@@ -213,15 +214,21 @@ const App = {
         this.ui.coverModalApply.addEventListener('click', () => this.applyCoverSelection());
         this.ui.coverFetchOnline.addEventListener('click', () => this.fetchOnlineCoverCandidates());
 
+        // Escape closes the topmost open dialog only. Chained else-if matters
+        // here: closing an editor can reveal the review queue underneath, and
+        // a second branch would immediately close that too.
         document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape' && !this.ui.modal.classList.contains('hidden')) {
+            if (e.key !== 'Escape') {
+                return;
+            }
+            if (!this.ui.modal.classList.contains('hidden')) {
                 this.closeModal();
-            }
-            if (e.key === 'Escape' && !this.ui.infoModal.classList.contains('hidden')) {
-                this.closeInfoModal();
-            }
-            if (e.key === 'Escape' && !this.ui.coverModal.classList.contains('hidden')) {
+            } else if (!this.ui.coverModal.classList.contains('hidden')) {
                 this.closeCoverModal();
+            } else if (!this.ui.infoModal.classList.contains('hidden')) {
+                this.closeInfoModal();
+            } else if (this.ui.reviewModal && !this.ui.reviewModal.classList.contains('hidden')) {
+                this.closeReviewModal();
             }
         });
     },
@@ -810,6 +817,7 @@ const App = {
         this.coverModalBookId = null;
         this.coverCandidatesByKey = {};
         this.ui.coverModal.classList.add('hidden');
+        this.restoreReviewModal();
     },
 
     renderCoverCandidates(candidates) {
@@ -993,6 +1001,7 @@ const App = {
     closeModal() {
         this.modalBookId = null;
         this.ui.modal.classList.add('hidden');
+        this.restoreReviewModal();
     },
 
     fillLocalFields(meta) {
@@ -1444,8 +1453,32 @@ const App = {
     },
 
     closeReviewModal() {
+        this.returnToReview = false;
         this.ui.reviewModal.classList.add('hidden');
         this.stopEnrichPolling();
+    },
+
+    // Hide the review queue while an edit or cover modal is open, remembering
+    // to come back to it. Stacking the dialogs would leave two scrollable
+    // layers fighting for the same backdrop and Escape key.
+    hideReviewModalForEditing() {
+        this.returnToReview = true;
+        this.ui.reviewModal.classList.add('hidden');
+        this.stopEnrichPolling();
+    },
+
+    // Called from every close path of the edit and cover modals, so the user
+    // lands back in the queue whether they saved, cancelled, pressed Escape,
+    // or clicked the backdrop.
+    restoreReviewModal() {
+        if (!this.returnToReview) {
+            return;
+        }
+        this.returnToReview = false;
+        this.ui.reviewModal.classList.remove('hidden');
+        // The book just edited may no longer belong in the queue.
+        this.loadQualitySummary();
+        this.loadReviewQueue();
     },
 
     async loadQualitySummary() {
@@ -1550,7 +1583,7 @@ const App = {
         if (editId) {
             const book = this.findBookById(editId);
             if (book) {
-                this.closeReviewModal();
+                this.hideReviewModalForEditing();
                 this.openModal(book);
             }
             return;
@@ -1558,7 +1591,7 @@ const App = {
         if (coverId) {
             const book = this.findBookById(coverId);
             if (book) {
-                this.closeReviewModal();
+                this.hideReviewModalForEditing();
                 this.openCoverModal(book);
             }
             return;
