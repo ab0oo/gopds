@@ -799,24 +799,29 @@ func categoriesFromSubjects(subjects []string) (string, string) {
 		return "", ""
 	}
 
+	// Prefer a canonical genre so the browse list stays short and mergeable:
+	// raw publisher subjects produce hundreds of near-duplicate categories.
+	// The most specific raw subject becomes the subcategory.
+	if genre := normalize.GenreFromSubjects(clean); genre != "" {
+		return genre, canonicalSubcategory(clean, genre)
+	}
+
+	// Hierarchical subjects ("Fiction > Science Fiction") may still yield a
+	// genre from a deeper level even when the whole string did not map.
 	for _, sep := range []string{" > ", ">", "/", "|", "::", "»"} {
-		if strings.Contains(clean[0], sep) {
-			parts := normalizeSubjectList(strings.Split(clean[0], sep))
-			if len(parts) >= 2 {
-				return parts[0], parts[1]
-			}
-			if len(parts) == 1 {
-				return parts[0], ""
-			}
+		if !strings.Contains(clean[0], sep) {
+			continue
+		}
+		parts := normalizeSubjectList(strings.Split(clean[0], sep))
+		if genre := normalize.GenreFromSubjects(parts); genre != "" {
+			return genre, canonicalSubcategory(parts, genre)
 		}
 	}
 
-	category := clean[0]
-	subcategory := ""
-	if len(clean) > 1 {
-		subcategory = clean[1]
-	}
-	return category, subcategory
+	// Nothing mapped to a known genre. Leaving the book uncategorized is
+	// better than creating a one-book category from a retailer tag or an
+	// author name, which is what these unmapped subjects almost always are.
+	return "", ""
 }
 
 func normalizeSubjectList(values []string) []string {
@@ -1609,4 +1614,29 @@ func bestCoverInEPUB(files []*zip.File) (*zip.File, int) {
 		}
 	}
 	return best, bestScore
+}
+
+// canonicalSubcategory picks a readable secondary label for a book whose
+// category has been mapped to a canonical genre. It returns "" when no subject
+// adds information beyond the genre itself.
+func canonicalSubcategory(subjects []string, genre string) string {
+	lowerGenre := strings.ToLower(genre)
+	for _, s := range subjects {
+		t := strings.TrimSpace(s)
+		if t == "" || len(t) > 40 {
+			continue
+		}
+		lt := strings.ToLower(t)
+		if lt == lowerGenre {
+			continue
+		}
+		// Skip keyword dumps and values that carry no genre meaning.
+		if strings.ContainsAny(t, ";|") || normalize.CanonicalGenre(t) == "" {
+			continue
+		}
+		if normalize.CanonicalGenre(t) == genre && !strings.EqualFold(t, genre) {
+			return t
+		}
+	}
+	return ""
 }
