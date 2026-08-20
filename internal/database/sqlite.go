@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS books (
 	mod_time DATETIME
 );`
 
+// RETURNING id is required for correctness here: on the DO UPDATE path
+// LastInsertId() reports the most recent *insert* rowid, not this row's id,
+// which previously caused covers to be filed under the wrong book on rescan.
 const saveBookSQL = `
 	INSERT INTO books (path, title, author, description, category, subcategory, mod_time)
 	VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -49,7 +52,8 @@ const saveBookSQL = `
 		description=excluded.description,
 		category=excluded.category,
 		subcategory=excluded.subcategory,
-		mod_time=excluded.mod_time`
+		mod_time=excluded.mod_time
+	RETURNING id`
 
 func New(dbPath string) (*DB, error) {
 	// SQLite reports a bare "unable to open database file" when the parent
@@ -100,12 +104,13 @@ func (db *DB) NeedsReScan(path string, currentModTime time.Time) bool {
 }
 
 func (db *DB) SaveBook(b Book) (int64, error) {
-	result, err := db.conn.Exec(saveBookSQL, b.Path, b.Title, b.Author, b.Description, b.Category, b.Subcategory, b.ModTime)
+	var id int64
+	err := db.conn.QueryRow(saveBookSQL, b.Path, b.Title, b.Author, b.Description,
+		b.Category, b.Subcategory, b.ModTime).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
-
-	return result.LastInsertId()
+	return id, nil
 }
 
 func (db *DB) Begin() (*sql.Tx, error) {
@@ -113,11 +118,13 @@ func (db *DB) Begin() (*sql.Tx, error) {
 }
 
 func (db *DB) SaveBookTx(tx *sql.Tx, b Book) (int64, error) {
-	result, err := tx.Exec(saveBookSQL, b.Path, b.Title, b.Author, b.Description, b.Category, b.Subcategory, b.ModTime)
+	var id int64
+	err := tx.QueryRow(saveBookSQL, b.Path, b.Title, b.Author, b.Description,
+		b.Category, b.Subcategory, b.ModTime).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
-	return result.LastInsertId()
+	return id, nil
 }
 
 func (db *DB) UpdateBookMetadata(id int, title, author, description string, modTime time.Time) error {
