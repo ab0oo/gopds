@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/ab0oo/gopds/internal/database"
+	"github.com/ab0oo/gopds/internal/normalize"
 )
 
 // EPUB internal XML structures
@@ -36,6 +37,7 @@ type OPF struct {
 	Creator     string   `xml:"metadata>creator"`
 	Description string   `xml:"metadata>description"`
 	Subjects    []string `xml:"metadata>subject"`
+	Identifiers []string `xml:"metadata>identifier"`
 	Meta        []struct {
 		Name    string `xml:"name,attr"`
 		Content string `xml:"content,attr"`
@@ -606,10 +608,13 @@ func (s *Scanner) Start(root string) error {
 	categorySource := resolveCategorySource()
 
 	stats := struct {
-		Total     int
-		Rescanned int
-		NoMeta    int
-		NoCover   int
+		Total      int
+		Rescanned  int
+		NoMeta     int
+		NoCover    int
+		Normalized int
+		Flagged    int
+		QualitySum int
 	}{}
 
 	tx, err := s.db.Begin()
@@ -641,10 +646,19 @@ func (s *Scanner) Start(root string) error {
 			}
 		}
 
+		// Tier 1: deterministic, offline normalization. Pure string rules --
+		// no network, no guessing. Anything ambiguous is flagged for review
+		// rather than rewritten.
+		authorRes := normalize.Author(meta.Creator)
+		titleRes := normalize.Title(meta.Title, "", "")
+		if authorRes.Changed || titleRes.Changed {
+			stats.Normalized++
+		}
+
 		book := database.Book{
 			Path:        path,
-			Title:       meta.Title,
-			Author:      meta.Creator,
+			Title:       titleRes.Title,
+			Author:      authorRes.Value,
 			Description: meta.Description,
 			ModTime:     info.ModTime(),
 		}
@@ -670,6 +684,36 @@ func (s *Scanner) Start(root string) error {
 			stats.NoCover++
 		}
 
+		cw, ch := normalize.CoverDimensions(coverCachePath(int(id)))
+		q := normalize.Score(normalize.QualityInput{
+			Title:       book.Title,
+			Author:      book.Author,
+			Description: book.Description,
+			Category:    book.Category,
+			Identifier:  identifierFromOPF(meta),
+			Series:      titleRes.Series,
+			SeriesIndex: titleRes.SeriesIndex,
+			CoverWidth:  cw,
+			CoverHeight: ch,
+			AuthorFlag:  authorRes.Flag,
+			TitleFlag:   titleRes.Flag,
+		})
+		stats.QualitySum += q.Score
+		flags := normalize.FlagsString(q.Flags)
+		if flags != "" {
+			stats.Flagged++
+		}
+		if err := s.db.SaveEnrichmentTx(tx, database.Enrichment{
+			BookID:      int(id),
+			Quality:     q.Score,
+			ReviewFlags: flags,
+			MetaSource:  "epub",
+			CoverSource: "epub",
+			LastChecked: time.Now().UTC(),
+		}); err != nil {
+			log.Printf("⚠  Error saving enrichment for book %d: %v", id, err)
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -686,6 +730,11 @@ func (s *Scanner) Start(root string) error {
 	log.Printf("New/Updated:       %d", stats.Rescanned)
 	log.Printf("Missing Metadata:   %d (Used filename instead)", stats.NoMeta)
 	log.Printf("Missing Covers:     %d", stats.NoCover)
+	log.Printf("Normalized:         %d", stats.Normalized)
+	log.Printf("Needing Review:     %d", stats.Flagged)
+	if stats.Rescanned > 0 {
+		log.Printf("Avg Quality:        %d/100", stats.QualitySum/stats.Rescanned)
+	}
 	log.Printf("-------------------------------\n")
 
 	return nil
@@ -1441,4 +1490,62 @@ func extractZipFile(f *zip.File, bookID int) error {
 
 	_, err = io.Copy(out, rc)
 	return err
+}
+
+// coverCachePath returns the cached cover location for a book id.
+func coverCachePath(bookID int) string {
+	return fmt.Sprintf("./data/covers/%d.jpg", bookID)
+}
+
+// identifierFromOPF pulls an ISBN-ish identifier out of parsed OPF metadata.
+// Most EPUBs carry it in <dc:identifier> rather than a <meta> tag, and many
+// store a UUID there instead, so prefer a value that actually looks like an
+// ISBN and fall back to any <meta> ISBN.
+func identifierFromOPF(opf *OPF) string {
+	if opf == nil {
+		return ""
+	}
+	for _, id := range opf.Identifiers {
+		if isbn := ISBNFromString(id); isbn != "" {
+			return isbn
+		}
+	}
+	for _, m := range opf.Meta {
+		if strings.Contains(strings.ToLower(m.Name), "isbn") {
+			if isbn := ISBNFromString(m.Content); isbn != "" {
+				return isbn
+			}
+		}
+	}
+	return ""
+}
+
+var isbnDigitsRe = regexp.MustCompile(`\d[\d-]{8,}[\dXx]`)
+
+// ISBNFromString extracts a 10- or 13-digit ISBN from a raw identifier value,
+// rejecting UUIDs and other non-ISBN identifiers.
+func ISBNFromString(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	// UUID-shaped identifiers are common in Calibre exports; never an ISBN.
+	if strings.Count(raw, "-") == 4 && len(raw) >= 32 {
+		return ""
+	}
+	m := isbnDigitsRe.FindString(raw)
+	if m == "" {
+		return ""
+	}
+	clean := strings.Map(func(r rune) rune {
+		if (r >= '0' && r <= '9') || r == 'X' || r == 'x' {
+			return r
+		}
+		return -1
+	}, m)
+	clean = strings.ToUpper(clean)
+	if len(clean) == 10 || len(clean) == 13 {
+		return clean
+	}
+	return ""
 }
