@@ -5,6 +5,8 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -50,6 +52,14 @@ const saveBookSQL = `
 		mod_time=excluded.mod_time`
 
 func New(dbPath string) (*DB, error) {
+	// SQLite reports a bare "unable to open database file" when the parent
+	// directory is missing, so create it up front for a clearer failure mode.
+	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("create database directory %s: %w", dir, err)
+		}
+	}
+
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, err
