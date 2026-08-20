@@ -45,6 +45,9 @@ type Server struct {
 
 	sessionMu sync.Mutex
 	sessions  map[string]authSession
+
+	enrichOnce sync.Once
+	enricher   *enricher
 }
 
 type authSession struct {
@@ -268,6 +271,15 @@ func (s *Server) Router() http.Handler {
 	r.Post("/api/admin/rebuild", s.requireAuth(s.HandleRebuildLibrary))
 	r.Post("/api/admin/rescan", s.requireAuth(s.HandleRescanLibrary))
 	r.Get("/api/admin/rebuild/status", s.requireAuth(s.HandleRebuildStatus))
+	r.Get("/api/admin/quality", s.requireAuth(s.HandleQualitySummary))
+	r.Get("/api/admin/quality/queue", s.requireAuth(s.HandleQualityQueue))
+	r.Post("/api/admin/enrich", s.requireAuth(s.HandleEnrichStart))
+	r.Post("/api/admin/enrich/stop", s.requireAuth(s.HandleEnrichStop))
+	r.Get("/api/admin/enrich/status", s.requireAuth(s.HandleEnrichStatus))
+	r.Get("/api/admin/enrich/proposals", s.requireAuth(s.HandleEnrichProposals))
+	r.Get("/api/admin/review", s.requireAuth(s.HandleReviewQueue))
+	r.Post("/api/admin/review/{id}/resolve", s.requireAuth(s.HandleReviewResolve))
+	r.Put("/api/admin/review/{id}/lock", s.requireAuth(s.HandleReviewLock))
 	r.Get("/api/openlibrary/search", s.HandleOpenLibrarySearch)
 	r.Get("/covers/{id}.jpg", s.HandleCover)
 	r.Get("/download/{id}", s.HandleDownload)
@@ -2362,4 +2374,40 @@ func nearestExistingDir(path string) string {
 		}
 		p = next
 	}
+}
+
+// HandleQualitySummary reports aggregate metadata health for the library.
+func (s *Server) HandleQualitySummary(w http.ResponseWriter, r *http.Request) {
+	summary, err := s.db.GetQualitySummary()
+	if err != nil {
+		log.Printf("quality summary error: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(summary)
+}
+
+// HandleQualityQueue returns the worst-scoring unlocked books, worst first.
+// This is the work queue that later enrichment tiers consume.
+func (s *Server) HandleQualityQueue(w http.ResponseWriter, r *http.Request) {
+	limit := parseIntDefault(r.URL.Query().Get("limit"), 50)
+	if limit < 1 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+
+	books, err := s.db.GetBooksNeedingWork(limit)
+	if err != nil {
+		log.Printf("quality queue error: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Count int             `json:"count"`
+		Books []database.Book `json:"books"`
+	}{Count: len(books), Books: books})
 }

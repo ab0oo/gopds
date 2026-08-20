@@ -44,6 +44,7 @@ All configuration is via environment variables.
 | `CATEGORY_SOURCE` | `none` | How categories are derived: `path`, `subject`, `auto`, or `none`. See below. |
 | `ONLINE_COVER_MIN_WIDTH` | `300` | Online cover candidates narrower than this are discarded. |
 | `ONLINE_COVER_MIN_HEIGHT` | `420` | Online cover candidates shorter than this are discarded. |
+| `ENRICH_RATE_MS` | `1000` | Milliseconds between upstream lookups during background enrichment. |
 | `LISTEN_ADDR` | `:8880` | Address the HTTP server binds to. |
 
 The server listens on port `8880` by default (see `LISTEN_ADDR`).
@@ -142,6 +143,13 @@ Admin-protected:
 - `POST /api/admin/rescan`
 - `POST /api/admin/rebuild`
 - `GET /api/admin/rebuild/status`
+- `GET /api/admin/quality`
+- `GET /api/admin/quality/queue`
+- `POST /api/admin/enrich`
+- `POST /api/admin/enrich/stop`
+- `GET /api/admin/enrich/status`
+- `GET /api/admin/enrich/proposals`
+- `GET /api/admin/review`
 
 Sessions are held in memory with a 12-hour TTL and delivered as an `HttpOnly` cookie.
 They do not survive a server restart.
@@ -161,6 +169,19 @@ names, and lifts trailing `(Series Name Book 3)` annotations out of titles into
 proper series fields. Anything it cannot decide with certainty -- multi-author
 strings, `writing as` pseudonyms, series text embedded in the author field -- is
 flagged for review rather than rewritten on a guess.
+
+**Background enrichment** (`POST /api/admin/enrich`) fills gaps from Open
+Library and Google Books. It is deliberately conservative:
+
+- **Dry run by default.** Pass `?apply=true` to write anything. Inspect the
+  result with `GET /api/admin/enrich/proposals` first.
+- **Gaps only.** A field that already has a local value is never overwritten;
+  the EPUB is treated as more authoritative than a remote guess.
+- **Only exact matches auto-apply.** A match needs an agreeing ISBN or a very
+  strong title *and* author agreement. Weaker matches are queued for review.
+- **Database only.** The automated pass does not modify EPUB files.
+- **Locked books are skipped**, so manual edits are never clobbered.
+- Rate-limited to one upstream request per second (`ENRICH_RATE_MS` to adjust).
 
 ## UI Notes
 

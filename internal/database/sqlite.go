@@ -513,3 +513,65 @@ func (db *DB) SetEnrichmentReview(bookID int, flag string) error {
 		WHERE book_enrichment.locked = 0`, bookID, flag)
 	return err
 }
+
+// ReviewItem is a book plus the quality record explaining why it needs work.
+type ReviewItem struct {
+	Book        Book   `json:"book"`
+	Quality     int    `json:"quality"`
+	ReviewFlags string `json:"review_flags"`
+	Locked      bool   `json:"locked"`
+}
+
+// GetReviewQueue returns books needing human attention, worst score first.
+// Locked books are excluded: the user has already ruled on them.
+func (db *DB) GetReviewQueue(flag string, limit, offset int) ([]ReviewItem, int, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+	where := "coalesce(e.locked,0) = 0 AND trim(coalesce(e.review_flags,'')) != ''"
+	args := []any{}
+	if f := strings.TrimSpace(flag); f != "" {
+		where += " AND ',' || e.review_flags || ',' LIKE ?"
+		args = append(args, "%,"+f+",%")
+	}
+
+	var total int
+	countQ := "SELECT COUNT(*) FROM books b JOIN book_enrichment e ON e.book_id = b.id WHERE " + where
+	if err := db.conn.QueryRow(countQ, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	q := `SELECT b.id, b.path, b.title, b.author, b.description, b.category, b.subcategory,
+	             b.mod_time, e.quality, coalesce(e.review_flags,''), coalesce(e.locked,0)
+	      FROM books b JOIN book_enrichment e ON e.book_id = b.id
+	      WHERE ` + where + `
+	      ORDER BY e.quality ASC, b.id ASC LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
+
+	rows, err := db.conn.Query(q, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := make([]ReviewItem, 0, limit)
+	for rows.Next() {
+		var it ReviewItem
+		var locked int
+		if err := rows.Scan(&it.Book.ID, &it.Book.Path, &it.Book.Title, &it.Book.Author,
+			&it.Book.Description, &it.Book.Category, &it.Book.Subcategory, &it.Book.ModTime,
+			&it.Quality, &it.ReviewFlags, &locked); err != nil {
+			return nil, 0, err
+		}
+		it.Locked = locked == 1
+		out = append(out, it)
+	}
+	return out, total, rows.Err()
+}
+
+// ClearEnrichmentReview removes review flags for a book, marking it resolved.
+func (db *DB) ClearEnrichmentReview(bookID int) error {
+	_, err := db.conn.Exec(
+		`UPDATE book_enrichment SET review_flags='' WHERE book_id = ?`, bookID)
+	return err
+}
