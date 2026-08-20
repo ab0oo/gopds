@@ -1382,10 +1382,14 @@ const App = {
                     <select id="review-flag" aria-label="Filter by issue">
                         <option value="">All issues</option>
                     </select>
-                    <button type="button" id="review-enrich" title="Look up missing metadata online (dry run)">Dry-run Enrich</button>
-                    <button type="button" id="review-enrich-apply" title="Apply high-confidence matches">Apply Enrich</button>
-                    <button type="button" id="review-covers" title="Find better cover art online (dry run)">Dry-run Covers</button>
-                    <button type="button" id="review-covers-apply" title="Replace low-quality covers with better online art">Upgrade Covers</button>
+                    <button type="button" id="review-enrich"
+                        title="PREVIEW ONLY - changes nothing.&#10;&#10;Looks up the worst-scoring books on Open Library and Google Books, and lists the missing descriptions, ISBNs, publishers, dates and subjects it could fill in. Review the list before applying.">Preview Metadata Fixes</button>
+                    <button type="button" id="review-enrich-apply"
+                        title="WRITES to the database cache (your EPUB files are not modified).&#10;&#10;Fills in ONLY empty fields, and only when a match is certain - an ISBN that agrees, or a title and author that both match closely. Anything less certain is added to this review list for you to decide. Books you have Locked are skipped.">Fill Missing Metadata</button>
+                    <button type="button" id="review-covers"
+                        title="PREVIEW ONLY - changes nothing.&#10;&#10;Searches Open Library and Google Books for better artwork for books whose cover is missing, too small, or the wrong shape, and reports what it found.">Preview Cover Upgrades</button>
+                    <button type="button" id="review-covers-apply"
+                        title="WRITES to the cover cache (your EPUB files are not modified).&#10;&#10;Replaces a cover only when the replacement is clearly better - bigger and correctly book-shaped. Lateral swaps are rejected.">Replace Poor Covers</button>
                     <span class="edit-status" id="review-enrich-status"></span>
                 </div>
                 <div id="review-list" class="review-list"></div>
@@ -1490,8 +1494,23 @@ const App = {
             }
             const s = await response.json();
             const avg = Math.round(s.avg_quality || 0);
-            this.ui.reviewSummary.textContent =
-                `${s.total} books | average quality ${avg}/100 | ${s.needs_review} need review | ${s.locked} locked`;
+            const unscored = Number(s.unscored || 0);
+
+            // An unscored library reports an average over the handful of books
+            // that happen to have rows, which reads as "quality 0/100" and is
+            // badly misleading. Say plainly that a rebuild is needed instead.
+            if (unscored > 0) {
+                this.ui.reviewSummary.innerHTML =
+                    `<strong>${unscored} of ${s.total} books have not been scored yet.</strong> ` +
+                    `Run <em>Rebuild</em> (the circular-arrow button) to scan every book and ` +
+                    `populate this queue. Until then these figures cover only ` +
+                    `${s.scored} book${s.scored === 1 ? '' : 's'}.`;
+                this.ui.reviewSummary.classList.add('review-summary-warn');
+            } else {
+                this.ui.reviewSummary.classList.remove('review-summary-warn');
+                this.ui.reviewSummary.textContent =
+                    `${s.total} books | average quality ${avg}/100 | ${s.needs_review} need review | ${s.locked} locked`;
+            }
 
             const flags = Object.entries(s.flag_counts || {})
                 .sort((a, b) => b[1] - a[1]);
@@ -1625,13 +1644,16 @@ const App = {
 
     async startEnrichment(apply) {
         if (apply && !window.confirm(
-            'Apply high-confidence metadata to the database cache?\n\n' +
-            'Only exact matches are applied, and only to empty fields. ' +
-            'EPUB files are not modified.')) {
+            'Fill in missing metadata from Open Library and Google Books?\n\n' +
+            'Only empty fields are filled, and only where the match is certain.\n' +
+            'Uncertain matches are added to the review list instead.\n' +
+            'Locked books are skipped. Your EPUB files are not modified.')) {
             return;
         }
 
-        this.ui.reviewEnrichStatus.textContent = apply ? 'Starting apply...' : 'Starting dry run...';
+        this.ui.reviewEnrichStatus.textContent = apply
+            ? 'Filling missing metadata...'
+            : 'Checking what could be filled in...';
         try {
             const response = await fetch(`/api/admin/enrich?apply=${apply}&limit=200`, { method: 'POST' });
             if (!response.ok) {
@@ -1647,8 +1669,9 @@ const App = {
 
     async upgradeCovers(apply) {
         if (apply && !window.confirm(
-            'Replace low-quality covers with better artwork found online?\n\n' +
-            'Only covers that are clearly an improvement are replaced. ' +
+            'Replace poor covers with better artwork found online?\n\n' +
+            'Only covers that are clearly better - bigger and correctly\n' +
+            'book-shaped - are replaced.\n' +
             'This updates the cover cache, not your EPUB files.')) {
             return;
         }
@@ -1707,7 +1730,7 @@ const App = {
             this.ui.reviewEnrichStatus.textContent = '';
             return;
         }
-        const mode = status.dry_run ? 'dry run' : 'apply';
+        const mode = status.dry_run ? 'preview' : 'filling';
         if (status.running) {
             this.ui.reviewEnrichStatus.textContent =
                 `${mode}: ${status.processed}/${status.total} | applied ${status.applied} | review ${status.queued_for_review}`;
@@ -1719,7 +1742,7 @@ const App = {
             return;
         }
         if (status.phase === 'complete') {
-            const verb = status.dry_run ? 'would update' : 'updated';
+            const verb = status.dry_run ? 'could fill' : 'filled';
             this.ui.reviewEnrichStatus.textContent =
                 `${mode} complete: ${verb} ${status.applied}, ${status.queued_for_review} queued, ${status.no_match} no match`;
             this.loadQualitySummary();

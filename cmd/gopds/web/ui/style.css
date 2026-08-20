@@ -536,16 +536,35 @@ button {
     font-size: 0.9rem;
 }
 
+/* Filter on its own line, then the four actions in a 2x2 grid so the
+   preview/apply pairs stay visually adjacent instead of wrapping raggedly. */
 .review-controls {
-    display: flex;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
     gap: 0.5rem;
     align-items: center;
     margin-bottom: 0.75rem;
 }
 
 .review-controls select {
+    grid-column: 1 / -1;
     min-width: 12rem;
+}
+
+.review-controls .edit-status {
+    grid-column: 1 / -1;
+}
+
+@media (min-width: 780px) {
+    .review-controls {
+        grid-template-columns: minmax(10rem, 1fr) repeat(4, auto);
+    }
+    .review-controls select {
+        grid-column: auto;
+    }
+    .review-controls .edit-status {
+        grid-column: 1 / -1;
+    }
 }
 
 .review-list {
@@ -843,4 +862,23 @@ button {
 
 .review-actions button[data-review-lock]:hover {
     background: rgba(214, 158, 46, 0.18);
+}
+
+/* Warn state for the review summary: shown when the library has not been
+   scored yet, so the quality figures cover almost nothing. */
+.review-summary-warn {
+    background: rgba(214, 158, 46, 0.14);
+    border: 1px solid rgba(214, 158, 46, 0.4);
+    color: #f0c674;
+    line-height: 1.5;
+}
+
+.review-summary-warn strong {
+    color: #ffd479;
+}
+
+.review-summary-warn em {
+    font-style: normal;
+    font-weight: 600;
+    color: #ffd479;
 }

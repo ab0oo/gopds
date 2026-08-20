@@ -438,6 +438,7 @@ func (db *DB) SetEnrichmentLocked(bookID int, locked bool) error {
 type QualitySummary struct {
 	Total       int            `json:"total"`
 	Scored      int            `json:"scored"`
+	Unscored    int            `json:"unscored"`
 	AvgQuality  float64        `json:"avg_quality"`
 	Locked      int            `json:"locked"`
 	FlagCounts  map[string]int `json:"flag_counts"`
@@ -457,12 +458,24 @@ func (db *DB) GetQualitySummary() (*QualitySummary, error) {
 	).Scan(&out.Scored, &avg); err != nil {
 		return nil, err
 	}
+	// AVG is over scored books only; an unscored library must not report 0/100
+	// as though every book were terrible.
 	if avg.Valid {
 		out.AvgQuality = avg.Float64
 	}
 
 	if err := db.conn.QueryRow(
 		`SELECT COUNT(*) FROM book_enrichment WHERE locked = 1`).Scan(&out.Locked); err != nil {
+		return nil, err
+	}
+
+	// Books with no enrichment row have never been scored. This is the normal
+	// state after upgrading an existing library: the incremental scan skips
+	// unchanged files, so nothing gets scored until a full rebuild runs.
+	if err := db.conn.QueryRow(`
+		SELECT COUNT(*) FROM books b
+		LEFT JOIN book_enrichment e ON e.book_id = b.id
+		WHERE e.book_id IS NULL`).Scan(&out.Unscored); err != nil {
 		return nil, err
 	}
 
@@ -489,6 +502,11 @@ func (db *DB) GetQualitySummary() (*QualitySummary, error) {
 
 // GetBooksNeedingWork returns the lowest-quality unlocked books first, which is
 // the work queue later enrichment tiers consume.
+//
+// Only scored books are returned. An unscored book has no enrichment row, and
+// coalescing its quality to 0 would rank it alongside genuinely bad books --
+// so before a scan has scored the library this degenerates into plain book-id
+// order, silently processing arbitrary books instead of the worst ones.
 func (db *DB) GetBooksNeedingWork(limit int) ([]Book, error) {
 	if limit <= 0 {
 		limit = 50
@@ -497,9 +515,9 @@ func (db *DB) GetBooksNeedingWork(limit int) ([]Book, error) {
 		SELECT b.id, b.path, b.title, b.author, b.description, b.category, b.subcategory,
 		       coalesce(b.series,''), coalesce(b.series_index,''), b.mod_time
 		FROM books b
-		LEFT JOIN book_enrichment e ON e.book_id = b.id
-		WHERE coalesce(e.locked, 0) = 0
-		ORDER BY coalesce(e.quality, 0) ASC, b.id ASC
+		JOIN book_enrichment e ON e.book_id = b.id
+		WHERE e.locked = 0
+		ORDER BY e.quality ASC, b.id ASC
 		LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
