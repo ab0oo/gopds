@@ -29,8 +29,8 @@ import (
 
 	"github.com/ab0oo/gopds/internal/database"
 	"github.com/ab0oo/gopds/internal/scanner"
-	"github.com/go-chi/chi/middleware"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 )
 
 type Server struct {

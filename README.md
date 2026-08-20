@@ -5,12 +5,14 @@ Obligatory screenshot for the reddit trolls:
 
 GoPDS is a lightweight OPDS server for EPUB libraries, with a web UI for live metadata and cover editing.
 
+It builds to a single static binary (pure-Go SQLite, no CGO) and ships as a ~21MB container image.
+
 ## Current Capabilities
 
 - OPDS catalog serving with large-library navigation:
   - Root OPDS navigation feed at `/opds`
   - Author-range browsing (`authors=a`, `authors=a-d`) with pagination
-  - Category/subcategory browsing at `/opds/categories` (optional path-derived indexing)
+  - Category/subcategory browsing at `/opds/categories`
 - Public book access:
   - OPDS feeds
   - JSON list (`/api/books`)
@@ -18,44 +20,65 @@ GoPDS is a lightweight OPDS server for EPUB libraries, with a web UI for live me
 - Authenticated admin editing:
   - Live EPUB metadata edit/write
   - Open Library + Google Books compare/apply workflow
-  - Cover candidate selection and apply
+  - Cover candidate selection and apply, from inside the EPUB or from online sources
   - Optional write selected cover into EPUB (`write_to_epub`)
   - Rebuild/rescan controls
 - Cover behavior:
-  - Cache cover writes to `data/covers/{id}.jpg`
+  - Cache cover writes to `{data dir}/covers/{id}.jpg`
   - When writing to EPUB, also writes sibling `cover.jpg` next to the EPUB file
   - EPUB cover normalization prefers canonical `cover.jpg`
 - Scanner modes:
-  - Incremental rescan (changed/new books only)
+  - Incremental rescan (changed/new books only, based on file mod time)
   - Full rebuild (drop DB cache + clear cover cache + full reindex)
 
 ## Configuration
 
-Environment variables:
+All configuration is via environment variables.
 
-- `BOOK_PATH` (default `./books`): Root of EPUB library.
-- `DB_PATH` (currently initialized in app as `./data/gopds.db`): SQLite cache location.
-- `ADMIN_USERNAME` (default `admin`): Admin username.
-- `ADMIN_PASSWORD` (required for authenticated features): Admin password.
-- `CATEGORY_FROM_PATH` (default disabled): If `true/1/yes/on`, category/subcategory are inferred from directory layout:
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BOOK_PATH` | `./books` | Root of the EPUB library. |
+| `DB_PATH` | `./data/gopds.db` | SQLite cache location. Parent directories are created automatically. |
+| `ADMIN_USERNAME` | `admin` | Admin username. |
+| `ADMIN_PASSWORD` | *(none)* | Required for authenticated features. If empty, all admin endpoints return 401. |
+| `CATEGORY_SOURCE` | `none` | How categories are derived: `path`, `subject`, `auto`, or `none`. See below. |
+| `ONLINE_COVER_MIN_WIDTH` | `300` | Online cover candidates narrower than this are discarded. |
+| `ONLINE_COVER_MIN_HEIGHT` | `420` | Online cover candidates shorter than this are discarded. |
+| `LISTEN_ADDR` | `:8880` | Address the HTTP server binds to. |
+
+The server listens on port `8880` by default (see `LISTEN_ADDR`).
+
+### Category sources
+
+`CATEGORY_SOURCE` selects how each book's category and subcategory are determined during a scan:
+
+- `path` — derived from directory layout under `BOOK_PATH`:
   - category = first folder under `BOOK_PATH`
   - subcategory = second folder under `BOOK_PATH` (optional)
+- `subject` — derived from the EPUB's `dc:subject` metadata.
+- `auto` — try `subject` first, fall back to `path` when the EPUB has no usable subjects.
+- `none` — no categories. The "Browse by Category" entry is omitted from the OPDS root.
 
-Example `docker-compose.yaml`:
+Two older boolean toggles are still honored for backward compatibility, but only when
+`CATEGORY_SOURCE` is unset: `CATEGORY_FROM_SUBJECT` (checked first) and `CATEGORY_FROM_PATH`.
+Both accept `1`, `true`, `yes`, or `on`. New deployments should use `CATEGORY_SOURCE`.
+
+### Example `docker-compose.yaml`
 
 ```yaml
 services:
   gopds:
     image: ghcr.io/ab0oo/gopds:latest
     container_name: gopds
+    user: "1000:1000" # Must own the book library if you want metadata/cover writes
     ports:
       - "8880:8880"
     environment:
       - BOOK_PATH=/app/books
       - DB_PATH=/app/data/gopds.db
-      - CATEGORY_FROM_PATH=true
+      - CATEGORY_SOURCE=subject
       - ADMIN_USERNAME=admin
-      - ADMIN_PASSWORD=change-this-password
+      - ADMIN_PASSWORD=${GOPDS_ADMIN_PASSWORD:?set this in a .env file}
     volumes:
       - /path/to/books:/app/books
       - /path/to/gopds-data:/app/data
@@ -64,8 +87,13 @@ services:
 
 Important:
 
-- If you want EPUB metadata/cover writes, the books volume must be writable.
+- The data volume must be writable by the container user, and must **not** live on
+  `tmpfs` (e.g. under `/var/run`), or the index and cover cache are lost on every reboot.
+  A missing-but-creatable directory is fine; an unwritable one fails at startup with
+  `unable to open database file`.
+- If you want EPUB metadata/cover writes, the books volume must be writable too.
 - If `ADMIN_PASSWORD` is empty, admin-protected editing features are unavailable.
+- Keep real passwords out of committed compose files; use a `.env` file or secrets.
 
 ## OPDS Endpoints
 
@@ -73,11 +101,17 @@ Important:
   - OPDS root navigation feed.
 - `GET /opds?authors=a`
 - `GET /opds?authors=a-d&page=1&limit=100`
-  - Author-range acquisition feeds (paginated).
+  - Author-range acquisition feeds (paginated). `authors=other` covers non-alphabetic
+    authors. `limit` defaults to 100 and is capped at 250.
+- `GET /opds/authors`
+  - Same behavior as `/opds`; accepts the same `authors` selector.
 - `GET /opds/categories`
 - `GET /opds/categories?category=Fiction`
 - `GET /opds/categories?category=Fiction&subcategory=SciFi&page=1&limit=100`
   - Category/subcategory navigation + acquisition feeds.
+
+`GET /` serves the OPDS catalog to OPDS clients and the HTML UI to browsers, based on the
+`Accept` header. Append `?opds=1` to force the catalog.
 
 ## Public vs Authenticated API
 
@@ -102,11 +136,15 @@ Admin-protected:
 - `GET /api/books/{id}/metadata/live`
 - `PUT /api/books/{id}/metadata`
 - `GET /api/books/{id}/covers/candidates`
+- `GET /api/books/{id}/covers/online`
 - `GET /api/books/{id}/covers/candidates/{key}`
 - `PUT /api/books/{id}/cover`
 - `POST /api/admin/rescan`
 - `POST /api/admin/rebuild`
 - `GET /api/admin/rebuild/status`
+
+Sessions are held in memory with a 12-hour TTL and delivered as an `HttpOnly` cookie.
+They do not survive a server restart.
 
 ## UI Notes
 
@@ -130,21 +168,40 @@ Then open:
 - Web UI: `http://localhost:8880/`
 - OPDS: `http://localhost:8880/opds`
 
+## Utilities
+
+`nester.go` is a standalone helper that reorganizes a flat directory of EPUBs into
+`Title/Title.epub` subfolders, using each book's own metadata to name them (handy for
+libraries full of hash-named files):
+
+```bash
+go run nester.go "/path/to/Some Author"
+```
+
+It is not part of the server build. Delete any stale shared `cover.jpg` in the directory
+before rescanning.
+
 ## CI/CD
 
 GitHub Actions workflow:
 
 - `.github/workflows/docker-build.yml`
-- Builds Docker image on push/PR/manual
-- Publishes to GHCR on non-PR events:
+- Builds the Docker image on push to `main`, tags, releases, PRs, and manual dispatch
+- Publishes to GHCR on `v*` tags and published releases:
   - `ghcr.io/<owner>/<repo>:latest` (default branch)
   - ref/tag/sha tags
 - Uploads a compressed Docker image tarball artifact for each run
 
 ## Security Recommendations
 
-- Use a strong `ADMIN_PASSWORD`.
-- Run behind HTTPS reverse proxy for internet exposure.
+- Use a strong `ADMIN_PASSWORD`, supplied via environment or secrets rather than a
+  committed file.
+- Run behind an HTTPS reverse proxy for internet exposure. The session cookie is only
+  marked `Secure` when the server itself terminates TLS.
+- Note that `/api/books` and `/download/{id}` are unauthenticated: anyone who can reach
+  the server can enumerate and download the library.
+- Outbound cover fetches are restricted to an allowlist of Open Library, Google Books,
+  and Wikimedia hosts.
 - Protect `main` with required signed commits.
 - Keep GHCR package visibility intentional (public/private).
 

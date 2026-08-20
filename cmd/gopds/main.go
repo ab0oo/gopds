@@ -26,7 +26,10 @@ func main() {
 	if bookPath == "" {
 		bookPath = "./books"
 	}
-	dbPath := "./data/gopds.db"
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = "./data/gopds.db"
+	}
 
 	// 2. Initialize Database
 	db, err := database.New(dbPath)
@@ -43,9 +46,14 @@ func main() {
 	}()
 
 	// 4. Setup Web Server
+	listenAddr := os.Getenv("LISTEN_ADDR")
+	if listenAddr == "" {
+		listenAddr = ":8880"
+	}
+
 	srv := web.NewServer(db, uiFS)
 	httpServer := &http.Server{
-		Addr:    ":8880",
+		Addr:    listenAddr,
 		Handler: srv.Router(),
 	}
 
@@ -56,7 +64,7 @@ func main() {
 
 	// Run the server in a goroutine so it doesn't block
 	go func() {
-		log.Printf("GoPDS is running on http://localhost:8880")
+		log.Printf("GoPDS is running on http://localhost%s", listenAddr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed: %v", err)
 		}
