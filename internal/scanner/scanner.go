@@ -650,7 +650,11 @@ func (s *Scanner) Start(root string) error {
 		// no network, no guessing. Anything ambiguous is flagged for review
 		// rather than rewritten.
 		authorRes := normalize.Author(meta.Creator)
-		titleRes := normalize.Title(meta.Title, "", "")
+		// Calibre and friends record the series in <meta name="calibre:series">.
+		// Prefer that over anything parsed out of the title.
+		titleRes := normalize.Title(meta.Title,
+			metaContentByName(meta, "calibre:series"),
+			metaContentByName(meta, "calibre:series_index"))
 		if authorRes.Changed || titleRes.Changed {
 			stats.Normalized++
 		}
@@ -660,6 +664,8 @@ func (s *Scanner) Start(root string) error {
 			Title:       titleRes.Title,
 			Author:      authorRes.Value,
 			Description: meta.Description,
+			Series:      titleRes.Series,
+			SeriesIndex: titleRes.SeriesIndex,
 			ModTime:     info.ModTime(),
 		}
 		switch categorySource {
@@ -1636,6 +1642,20 @@ func canonicalSubcategory(subjects []string, genre string) string {
 		}
 		if normalize.CanonicalGenre(t) == genre && !strings.EqualFold(t, genre) {
 			return t
+		}
+	}
+	return ""
+}
+
+// metaContentByName reads a <meta name="..." content="..."> value from parsed
+// OPF metadata.
+func metaContentByName(opf *OPF, name string) string {
+	if opf == nil {
+		return ""
+	}
+	for _, m := range opf.Meta {
+		if strings.EqualFold(strings.TrimSpace(m.Name), name) {
+			return strings.TrimSpace(m.Content)
 		}
 	}
 	return ""

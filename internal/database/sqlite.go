@@ -21,6 +21,8 @@ type Book struct {
 	Description string    `json:"description"`
 	Category    string    `json:"category"`
 	Subcategory string    `json:"subcategory"`
+	Series      string    `json:"series"`
+	SeriesIndex string    `json:"series_index"`
 	ModTime     time.Time `json:"mod_time"`
 }
 
@@ -37,12 +39,11 @@ CREATE TABLE IF NOT EXISTS books (
 	description TEXT,
 	category TEXT,
 	subcategory TEXT,
+	series TEXT,
+	series_index TEXT,
 	mod_time DATETIME
 );`
 
-// RETURNING id is required for correctness here: on the DO UPDATE path
-// LastInsertId() reports the most recent *insert* rowid, not this row's id,
-// which previously caused covers to be filed under the wrong book on rescan.
 // book_enrichment records what we know *about* each book's metadata quality,
 // separate from the metadata itself. Keeping it in its own table means a full
 // rebuild can drop and re-derive `books` without losing human decisions.
@@ -70,14 +71,16 @@ const saveEnrichmentSQL = `
 // LastInsertId() reports the most recent *insert* rowid, not this row's id,
 // which previously caused covers to be filed under the wrong book on rescan.
 const saveBookSQL = `
-	INSERT INTO books (path, title, author, description, category, subcategory, mod_time)
-	VALUES (?, ?, ?, ?, ?, ?, ?)
+	INSERT INTO books (path, title, author, description, category, subcategory, series, series_index, mod_time)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(path) DO UPDATE SET
 		title=excluded.title,
 		author=excluded.author,
 		description=excluded.description,
 		category=excluded.category,
 		subcategory=excluded.subcategory,
+		series=excluded.series,
+		series_index=excluded.series_index,
 		mod_time=excluded.mod_time
 	RETURNING id`
 
@@ -135,7 +138,7 @@ func (db *DB) NeedsReScan(path string, currentModTime time.Time) bool {
 func (db *DB) SaveBook(b Book) (int64, error) {
 	var id int64
 	err := db.conn.QueryRow(saveBookSQL, b.Path, b.Title, b.Author, b.Description,
-		b.Category, b.Subcategory, b.ModTime).Scan(&id)
+		b.Category, b.Subcategory, b.Series, b.SeriesIndex, b.ModTime).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
@@ -149,7 +152,7 @@ func (db *DB) Begin() (*sql.Tx, error) {
 func (db *DB) SaveBookTx(tx *sql.Tx, b Book) (int64, error) {
 	var id int64
 	err := tx.QueryRow(saveBookSQL, b.Path, b.Title, b.Author, b.Description,
-		b.Category, b.Subcategory, b.ModTime).Scan(&id)
+		b.Category, b.Subcategory, b.Series, b.SeriesIndex, b.ModTime).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
@@ -186,7 +189,7 @@ func (db *DB) RebuildBooksTable() error {
 
 // GetAllBooks retrieves every book stored in the database.
 func (db *DB) GetAllBooks() ([]Book, error) {
-	query := "SELECT id, path, title, author, description, category, subcategory, mod_time FROM books"
+	query := "SELECT id, path, title, author, description, category, subcategory, coalesce(series,''), coalesce(series_index,''), mod_time FROM books"
 	rows, err := db.conn.Query(query)
 	if err != nil {
 		return nil, err
@@ -196,7 +199,7 @@ func (db *DB) GetAllBooks() ([]Book, error) {
 	var books []Book
 	for rows.Next() {
 		var b Book
-		err := rows.Scan(&b.ID, &b.Path, &b.Title, &b.Author, &b.Description, &b.Category, &b.Subcategory, &b.ModTime)
+		err := rows.Scan(&b.ID, &b.Path, &b.Title, &b.Author, &b.Description, &b.Category, &b.Subcategory, &b.Series, &b.SeriesIndex, &b.ModTime)
 		if err != nil {
 			return nil, err
 		}
@@ -207,8 +210,8 @@ func (db *DB) GetAllBooks() ([]Book, error) {
 
 func (db *DB) GetBookByID(id string) (*Book, error) {
 	var b Book
-	query := "SELECT id, path, title, author, description, category, subcategory, mod_time FROM books WHERE id = ?"
-	err := db.conn.QueryRow(query, id).Scan(&b.ID, &b.Path, &b.Title, &b.Author, &b.Description, &b.Category, &b.Subcategory, &b.ModTime)
+	query := "SELECT id, path, title, author, description, category, subcategory, coalesce(series,''), coalesce(series_index,''), mod_time FROM books WHERE id = ?"
+	err := db.conn.QueryRow(query, id).Scan(&b.ID, &b.Path, &b.Title, &b.Author, &b.Description, &b.Category, &b.Subcategory, &b.Series, &b.SeriesIndex, &b.ModTime)
 	if err != nil {
 		return nil, err
 	}
@@ -246,6 +249,16 @@ func ensureBooksColumns(db *sql.DB) error {
 			return err
 		}
 	}
+	if _, ok := existing["series"]; !ok {
+		if _, err := db.Exec("ALTER TABLE books ADD COLUMN series TEXT"); err != nil {
+			return err
+		}
+	}
+	if _, ok := existing["series_index"]; !ok {
+		if _, err := db.Exec("ALTER TABLE books ADD COLUMN series_index TEXT"); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -280,7 +293,7 @@ func (db *DB) GetBooksByAuthorRange(start, end string, includeOther bool, limit,
 	}
 
 	query := fmt.Sprintf(
-		"SELECT id, path, title, author, description, category, subcategory, mod_time FROM books WHERE %s ORDER BY author COLLATE NOCASE, title COLLATE NOCASE, id LIMIT ? OFFSET ?",
+		"SELECT id, path, title, author, description, category, subcategory, coalesce(series,''), coalesce(series_index,''), mod_time FROM books WHERE %s ORDER BY author COLLATE NOCASE, title COLLATE NOCASE, id LIMIT ? OFFSET ?",
 		where,
 	)
 	args = append(args, limit, offset)
@@ -294,7 +307,7 @@ func (db *DB) GetBooksByAuthorRange(start, end string, includeOther bool, limit,
 	books := make([]Book, 0, limit)
 	for rows.Next() {
 		var b Book
-		if err := rows.Scan(&b.ID, &b.Path, &b.Title, &b.Author, &b.Description, &b.Category, &b.Subcategory, &b.ModTime); err != nil {
+		if err := rows.Scan(&b.ID, &b.Path, &b.Title, &b.Author, &b.Description, &b.Category, &b.Subcategory, &b.Series, &b.SeriesIndex, &b.ModTime); err != nil {
 			return nil, err
 		}
 		books = append(books, b)
@@ -364,7 +377,7 @@ func (db *DB) GetBooksByCategory(category, subcategory string, limit, offset int
 	category = strings.TrimSpace(category)
 	subcategory = strings.TrimSpace(subcategory)
 
-	query := "SELECT id, path, title, author, description, category, subcategory, mod_time FROM books WHERE trim(coalesce(category,'')) = ?"
+	query := "SELECT id, path, title, author, description, category, subcategory, coalesce(series,''), coalesce(series_index,''), mod_time FROM books WHERE trim(coalesce(category,'')) = ?"
 	args := []any{category}
 	if subcategory != "" {
 		query += " AND trim(coalesce(subcategory,'')) = ?"
@@ -382,7 +395,7 @@ func (db *DB) GetBooksByCategory(category, subcategory string, limit, offset int
 	books := make([]Book, 0, limit)
 	for rows.Next() {
 		var b Book
-		if err := rows.Scan(&b.ID, &b.Path, &b.Title, &b.Author, &b.Description, &b.Category, &b.Subcategory, &b.ModTime); err != nil {
+		if err := rows.Scan(&b.ID, &b.Path, &b.Title, &b.Author, &b.Description, &b.Category, &b.Subcategory, &b.Series, &b.SeriesIndex, &b.ModTime); err != nil {
 			return nil, err
 		}
 		books = append(books, b)
@@ -481,7 +494,8 @@ func (db *DB) GetBooksNeedingWork(limit int) ([]Book, error) {
 		limit = 50
 	}
 	rows, err := db.conn.Query(`
-		SELECT b.id, b.path, b.title, b.author, b.description, b.category, b.subcategory, b.mod_time
+		SELECT b.id, b.path, b.title, b.author, b.description, b.category, b.subcategory,
+		       coalesce(b.series,''), coalesce(b.series_index,''), b.mod_time
 		FROM books b
 		LEFT JOIN book_enrichment e ON e.book_id = b.id
 		WHERE coalesce(e.locked, 0) = 0
@@ -496,7 +510,7 @@ func (db *DB) GetBooksNeedingWork(limit int) ([]Book, error) {
 	for rows.Next() {
 		var b Book
 		if err := rows.Scan(&b.ID, &b.Path, &b.Title, &b.Author, &b.Description,
-			&b.Category, &b.Subcategory, &b.ModTime); err != nil {
+			&b.Category, &b.Subcategory, &b.Series, &b.SeriesIndex, &b.ModTime); err != nil {
 			return nil, err
 		}
 		books = append(books, b)
@@ -542,6 +556,7 @@ func (db *DB) GetReviewQueue(flag string, limit, offset int) ([]ReviewItem, int,
 	}
 
 	q := `SELECT b.id, b.path, b.title, b.author, b.description, b.category, b.subcategory,
+	             coalesce(b.series,''), coalesce(b.series_index,''),
 	             b.mod_time, e.quality, coalesce(e.review_flags,''), coalesce(e.locked,0)
 	      FROM books b JOIN book_enrichment e ON e.book_id = b.id
 	      WHERE ` + where + `
@@ -559,7 +574,8 @@ func (db *DB) GetReviewQueue(flag string, limit, offset int) ([]ReviewItem, int,
 		var it ReviewItem
 		var locked int
 		if err := rows.Scan(&it.Book.ID, &it.Book.Path, &it.Book.Title, &it.Book.Author,
-			&it.Book.Description, &it.Book.Category, &it.Book.Subcategory, &it.Book.ModTime,
+			&it.Book.Description, &it.Book.Category, &it.Book.Subcategory,
+			&it.Book.Series, &it.Book.SeriesIndex, &it.Book.ModTime,
 			&it.Quality, &it.ReviewFlags, &locked); err != nil {
 			return nil, 0, err
 		}

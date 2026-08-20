@@ -62,9 +62,16 @@ button {
 
 .browse-row {
     display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
     gap: 10px;
     margin-top: 10px;
+    align-items: center;
+}
+
+@media (max-width: 900px) {
+    .browse-row {
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    }
 }
 
 .browse-row select {
@@ -513,4 +520,327 @@ button {
     .ol-controls {
         grid-template-columns: 1fr;
     }
+}
+
+/* --- Metadata review queue --- */
+.review-dialog {
+    max-width: 900px;
+    width: 92vw;
+}
+
+.review-summary {
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.75rem;
+    border-radius: 6px;
+    background: rgba(127, 127, 127, 0.12);
+    font-size: 0.9rem;
+}
+
+.review-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+    margin-bottom: 0.75rem;
+}
+
+.review-controls select {
+    min-width: 12rem;
+}
+
+.review-list {
+    max-height: 55vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.review-row {
+    display: grid;
+    grid-template-columns: 48px 1fr auto auto;
+    gap: 0.75rem;
+    align-items: center;
+    padding: 0.5rem;
+    border-radius: 6px;
+    background: rgba(127, 127, 127, 0.08);
+}
+
+.review-cover {
+    width: 48px;
+    height: 68px;
+    object-fit: cover;
+    border-radius: 3px;
+    background: rgba(127, 127, 127, 0.2);
+}
+
+.review-meta {
+    min-width: 0;
+}
+
+.review-title {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.review-author {
+    font-size: 0.85rem;
+    opacity: 0.75;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.review-flags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    margin-top: 0.25rem;
+}
+
+.review-flag {
+    font-size: 0.7rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 10px;
+    background: rgba(200, 120, 60, 0.25);
+    white-space: nowrap;
+}
+
+.review-score {
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+    opacity: 0.8;
+    min-width: 2.5rem;
+    text-align: right;
+}
+
+.review-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+}
+
+.review-actions button {
+    font-size: 0.78rem;
+    padding: 0.25rem 0.5rem;
+}
+
+.review-pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+    margin-top: 0.75rem;
+    font-size: 0.85rem;
+}
+
+.review-empty {
+    padding: 1.5rem;
+    text-align: center;
+    opacity: 0.7;
+}
+
+@media (max-width: 640px) {
+    .review-row {
+        grid-template-columns: 40px 1fr auto;
+    }
+    .review-actions {
+        grid-column: 1 / -1;
+        justify-content: flex-end;
+    }
+}
+
+/* --- Missing-cover placeholder --- */
+.book img.cover-missing {
+    object-fit: contain;
+    background: var(--panel-2);
+}
+
+/* --- Series grouping --- */
+.series-badge {
+    display: inline-block;
+    align-self: center;
+    max-width: 100%;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 0.72rem;
+    color: var(--accent);
+    background: rgba(91, 192, 190, 0.12);
+    border: 1px solid rgba(91, 192, 190, 0.3);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* The stack is inset so the fanned covers behind it have room to show. */
+.series-stack {
+    position: relative;
+    aspect-ratio: 2 / 3;
+    cursor: pointer;
+    margin: 6px 10px 0 10px;
+}
+
+.series-cover {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: 8px;
+    background: #2a2a2a;
+    border: 1px solid var(--border);
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.5);
+    transition: transform 0.18s ease;
+}
+
+/* Fan the stack so it reads as several books, not one. */
+.series-cover-2 { transform: translate(-11px, -7px) rotate(-6deg); opacity: 0.65; }
+.series-cover-1 { transform: translate(-6px, -4px) rotate(-3deg); opacity: 0.85; }
+.series-cover-0 { transform: none; opacity: 1; }
+
+.series-stack:hover .series-cover-2 { transform: translate(-16px, -10px) rotate(-9deg); }
+.series-stack:hover .series-cover-1 { transform: translate(-9px, -5px) rotate(-4.5deg); }
+
+.series-count {
+    position: absolute;
+    right: 6px;
+    bottom: 6px;
+    z-index: 2;
+    min-width: 24px;
+    padding: 2px 7px;
+    border-radius: 12px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-align: center;
+    color: #06222b;
+    background: var(--accent);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+}
+
+.book-series .book-title {
+    color: var(--accent);
+}
+
+/* Match the themed action buttons rather than falling back to the
+   browser default, which renders as a bright white block. */
+.series-expand {
+    width: 100%;
+    border-radius: 9px;
+    border: 1px solid rgba(91, 192, 190, 0.35);
+    background: rgba(91, 192, 190, 0.12);
+    color: var(--accent);
+    padding: 8px 10px;
+    font-size: 0.86rem;
+    cursor: pointer;
+}
+
+.series-expand:hover {
+    background: rgba(91, 192, 190, 0.2);
+}
+
+/* Keep every card the same height so grid rows stay flush. */
+.book {
+    justify-content: flex-start;
+}
+
+.book .book-actions {
+    margin-top: auto;
+}
+
+.library-empty {
+    grid-column: 1 / -1;
+    padding: 3rem 1rem;
+    text-align: center;
+    color: var(--text-muted);
+}
+
+/* Its own row: a nowrap label inside an fr-sized grid cell always overflows. */
+.browse-options {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 8px;
+}
+
+.group-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+
+.group-toggle input {
+    flex: 0 0 auto;
+    margin: 0;
+}
+
+.group-toggle span {
+    white-space: nowrap;
+}
+
+.group-toggle input {
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+
+/* --- Themed buttons for modal controls ---
+   Without these the browser default (light grey) shows through and reads as
+   broken against the dark theme. */
+.review-controls button,
+.review-actions button,
+.review-pager button,
+#cover-apply {
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: #12212e;
+    color: var(--text-main);
+    padding: 7px 12px;
+    font-size: 0.84rem;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.review-controls button:hover,
+.review-actions button:hover,
+.review-pager button:hover,
+#cover-apply:hover {
+    background: #172c3c;
+    border-color: var(--accent);
+}
+
+.review-controls button:disabled,
+.review-actions button:disabled,
+.review-pager button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Actions that write data get accent treatment so they read as deliberate. */
+#review-enrich-apply,
+#review-covers-apply,
+#cover-apply {
+    border-color: rgba(91, 192, 190, 0.4);
+    background: rgba(91, 192, 190, 0.14);
+    color: var(--accent);
+}
+
+#review-enrich-apply:hover,
+#review-covers-apply:hover,
+#cover-apply:hover {
+    background: rgba(91, 192, 190, 0.22);
+}
+
+/* Lock is destructive-ish: it permanently exempts a book from automation. */
+.review-actions button[data-review-lock] {
+    border-color: rgba(214, 158, 46, 0.4);
+    color: #d69e2e;
+    background: rgba(214, 158, 46, 0.1);
+}
+
+.review-actions button[data-review-lock]:hover {
+    background: rgba(214, 158, 46, 0.18);
 }
