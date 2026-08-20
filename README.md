@@ -146,6 +146,22 @@ Admin-protected:
 Sessions are held in memory with a 12-hour TTL and delivered as an `HttpOnly` cookie.
 They do not survive a server restart.
 
+## Metadata Quality
+
+Every scan scores each book 0-100 on metadata completeness (description, cover
+size, author form, category, identifier, series) and records the result in a
+`book_enrichment` table kept separate from `books`, so a full rebuild never
+discards human decisions.
+
+Two cleanup layers build on that score:
+
+**Deterministic normalization** runs on every scan with no network access. It
+canonicalizes `Last, First` author names to `First Last`, repairs ALL-CAPS
+names, and lifts trailing `(Series Name Book 3)` annotations out of titles into
+proper series fields. Anything it cannot decide with certainty -- multi-author
+strings, `writing as` pseudonyms, series text embedded in the author field -- is
+flagged for review rather than rewritten on a guess.
+
 ## UI Notes
 
 - Browser UI is at `/`.

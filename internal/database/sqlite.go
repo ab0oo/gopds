@@ -43,6 +43,32 @@ CREATE TABLE IF NOT EXISTS books (
 // RETURNING id is required for correctness here: on the DO UPDATE path
 // LastInsertId() reports the most recent *insert* rowid, not this row's id,
 // which previously caused covers to be filed under the wrong book on rescan.
+// book_enrichment records what we know *about* each book's metadata quality,
+// separate from the metadata itself. Keeping it in its own table means a full
+// rebuild can drop and re-derive `books` without losing human decisions.
+const enrichmentTableDDL = `
+CREATE TABLE IF NOT EXISTS book_enrichment (
+	book_id       INTEGER PRIMARY KEY,
+	quality       INTEGER NOT NULL DEFAULT 0,
+	review_flags  TEXT NOT NULL DEFAULT '',
+	meta_source   TEXT NOT NULL DEFAULT 'epub',
+	cover_source  TEXT NOT NULL DEFAULT 'epub',
+	locked        INTEGER NOT NULL DEFAULT 0,
+	last_checked  DATETIME
+);`
+
+const saveEnrichmentSQL = `
+	INSERT INTO book_enrichment (book_id, quality, review_flags, meta_source, cover_source, last_checked)
+	VALUES (?, ?, ?, ?, ?, ?)
+	ON CONFLICT(book_id) DO UPDATE SET
+		quality=excluded.quality,
+		review_flags=excluded.review_flags,
+		last_checked=excluded.last_checked
+	WHERE book_enrichment.locked = 0`
+
+// RETURNING id is required for correctness here: on the DO UPDATE path
+// LastInsertId() reports the most recent *insert* rowid, not this row's id,
+// which previously caused covers to be filed under the wrong book on rescan.
 const saveBookSQL = `
 	INSERT INTO books (path, title, author, description, category, subcategory, mod_time)
 	VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -84,6 +110,9 @@ func New(dbPath string) (*DB, error) {
 	}
 
 	if _, err := db.Exec(booksTableDDL); err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(enrichmentTableDDL); err != nil {
 		return nil, err
 	}
 	if err := ensureBooksColumns(db); err != nil {
@@ -359,4 +388,128 @@ func (db *DB) GetBooksByCategory(category, subcategory string, limit, offset int
 		books = append(books, b)
 	}
 	return books, nil
+}
+
+// Enrichment is the quality/provenance record for one book.
+type Enrichment struct {
+	BookID      int       `json:"book_id"`
+	Quality     int       `json:"quality"`
+	ReviewFlags string    `json:"review_flags"`
+	MetaSource  string    `json:"meta_source"`
+	CoverSource string    `json:"cover_source"`
+	Locked      bool      `json:"locked"`
+	LastChecked time.Time `json:"last_checked"`
+}
+
+// SaveEnrichmentTx upserts a quality record. Rows the user has locked are left
+// alone: a human decision always outranks an automated one.
+func (db *DB) SaveEnrichmentTx(tx *sql.Tx, e Enrichment) error {
+	_, err := tx.Exec(saveEnrichmentSQL, e.BookID, e.Quality, e.ReviewFlags,
+		e.MetaSource, e.CoverSource, e.LastChecked)
+	return err
+}
+
+// SetEnrichmentLocked marks a book as human-curated (or releases it).
+func (db *DB) SetEnrichmentLocked(bookID int, locked bool) error {
+	v := 0
+	if locked {
+		v = 1
+	}
+	_, err := db.conn.Exec(`
+		INSERT INTO book_enrichment (book_id, locked) VALUES (?, ?)
+		ON CONFLICT(book_id) DO UPDATE SET locked=excluded.locked`, bookID, v)
+	return err
+}
+
+// QualitySummary is an aggregate view of library health.
+type QualitySummary struct {
+	Total       int            `json:"total"`
+	Scored      int            `json:"scored"`
+	AvgQuality  float64        `json:"avg_quality"`
+	Locked      int            `json:"locked"`
+	FlagCounts  map[string]int `json:"flag_counts"`
+	NeedsReview int            `json:"needs_review"`
+}
+
+func (db *DB) GetQualitySummary() (*QualitySummary, error) {
+	out := &QualitySummary{FlagCounts: map[string]int{}}
+
+	if err := db.conn.QueryRow(`SELECT COUNT(*) FROM books`).Scan(&out.Total); err != nil {
+		return nil, err
+	}
+
+	var avg sql.NullFloat64
+	if err := db.conn.QueryRow(
+		`SELECT COUNT(*), AVG(quality) FROM book_enrichment`,
+	).Scan(&out.Scored, &avg); err != nil {
+		return nil, err
+	}
+	if avg.Valid {
+		out.AvgQuality = avg.Float64
+	}
+
+	if err := db.conn.QueryRow(
+		`SELECT COUNT(*) FROM book_enrichment WHERE locked = 1`).Scan(&out.Locked); err != nil {
+		return nil, err
+	}
+
+	rows, err := db.conn.Query(
+		`SELECT review_flags FROM book_enrichment WHERE trim(review_flags) != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var flags string
+		if err := rows.Scan(&flags); err != nil {
+			return nil, err
+		}
+		out.NeedsReview++
+		for _, f := range strings.Split(flags, ",") {
+			if f = strings.TrimSpace(f); f != "" {
+				out.FlagCounts[f]++
+			}
+		}
+	}
+	return out, rows.Err()
+}
+
+// GetBooksNeedingWork returns the lowest-quality unlocked books first, which is
+// the work queue later enrichment tiers consume.
+func (db *DB) GetBooksNeedingWork(limit int) ([]Book, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := db.conn.Query(`
+		SELECT b.id, b.path, b.title, b.author, b.description, b.category, b.subcategory, b.mod_time
+		FROM books b
+		LEFT JOIN book_enrichment e ON e.book_id = b.id
+		WHERE coalesce(e.locked, 0) = 0
+		ORDER BY coalesce(e.quality, 0) ASC, b.id ASC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	books := make([]Book, 0, limit)
+	for rows.Next() {
+		var b Book
+		if err := rows.Scan(&b.ID, &b.Path, &b.Title, &b.Author, &b.Description,
+			&b.Category, &b.Subcategory, &b.ModTime); err != nil {
+			return nil, err
+		}
+		books = append(books, b)
+	}
+	return books, rows.Err()
+}
+
+// SetEnrichmentReview records that a book needs human review, without
+// disturbing its quality score or locked state.
+func (db *DB) SetEnrichmentReview(bookID int, flag string) error {
+	_, err := db.conn.Exec(`
+		INSERT INTO book_enrichment (book_id, review_flags) VALUES (?, ?)
+		ON CONFLICT(book_id) DO UPDATE SET review_flags=excluded.review_flags
+		WHERE book_enrichment.locked = 0`, bookID, flag)
+	return err
 }
