@@ -280,6 +280,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/api/admin/review", s.requireAuth(s.HandleReviewQueue))
 	r.Post("/api/admin/review/{id}/resolve", s.requireAuth(s.HandleReviewResolve))
 	r.Put("/api/admin/review/{id}/lock", s.requireAuth(s.HandleReviewLock))
+	r.Post("/api/admin/covers/upgrade", s.requireAuth(s.HandleCoverUpgrade))
 	r.Get("/api/openlibrary/search", s.HandleOpenLibrarySearch)
 	r.Get("/covers/{id}.jpg", s.HandleCover)
 	r.Get("/download/{id}", s.HandleDownload)
