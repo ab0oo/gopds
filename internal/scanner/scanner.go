@@ -690,21 +690,8 @@ func (s *Scanner) Start(root string) error {
 			stats.NoCover++
 		}
 
-		cw, ch := normalize.CoverDimensions(coverCachePath(int(id)))
-		q := normalize.Score(normalize.QualityInput{
-			Title:       book.Title,
-			Author:      book.Author,
-			Description: book.Description,
-			Category:    book.Category,
-			Identifier:  identifierFromOPF(meta),
-			Series:      titleRes.Series,
-			SeriesIndex: titleRes.SeriesIndex,
-			CoverName:   "cover.jpg",
-			CoverWidth:  cw,
-			CoverHeight: ch,
-			AuthorFlag:  authorRes.Flag,
-			TitleFlag:   titleRes.Flag,
-		})
+		q := ScoreBook(book, int(id), identifierFromOPF(meta),
+			titleRes.Series, titleRes.SeriesIndex, authorRes.Flag, titleRes.Flag)
 		stats.QualitySum += q.Score
 		flags := normalize.FlagsString(q.Flags)
 		if flags != "" {
@@ -1659,4 +1646,54 @@ func metaContentByName(opf *OPF, name string) string {
 		}
 	}
 	return ""
+}
+
+// ScoreBook rates a book's metadata completeness using its current database
+// row and cached cover. Both the scanner and the on-demand rescore endpoint
+// call this, so a book scored during a scan and a book rescored after manual
+// edits are judged by exactly the same rules.
+func ScoreBook(book database.Book, bookID int, identifier, series, seriesIndex,
+	authorFlag, titleFlag string) normalize.QualityResult {
+	cw, ch := normalize.CoverDimensions(coverCachePath(bookID))
+	return normalize.Score(normalize.QualityInput{
+		Title:       book.Title,
+		Author:      book.Author,
+		Description: book.Description,
+		Category:    book.Category,
+		Identifier:  identifier,
+		Series:      series,
+		SeriesIndex: seriesIndex,
+		CoverName:   "cover.jpg",
+		CoverWidth:  cw,
+		CoverHeight: ch,
+		AuthorFlag:  authorFlag,
+		TitleFlag:   titleFlag,
+	})
+}
+
+// RescoreBook re-reads a book's live EPUB metadata and cached cover and
+// returns a fresh quality result. Used after manual edits or an applied
+// cover change, where the database row alone does not reflect everything
+// that was written to the file.
+func RescoreBook(book database.Book, epubPath string) normalize.QualityResult {
+	identifier := ""
+	series := ""
+	seriesIndex := ""
+	authorFlag := ""
+	titleFlag := ""
+
+	if live, err := ExtractLiveMetadata(epubPath); err == nil && live != nil {
+		identifier = ISBNFromString(live.Identifier)
+		series = live.Series
+		seriesIndex = live.SeriesIndex
+		// Re-run the deterministic checks so a book whose author was fixed by
+		// hand stops carrying its old ambiguity flag.
+		authorFlag = normalize.Author(book.Author).Flag
+		titleRes := normalize.Title(book.Title, series, seriesIndex)
+		titleFlag = titleRes.Flag
+		series = titleRes.Series
+		seriesIndex = titleRes.SeriesIndex
+	}
+
+	return ScoreBook(book, book.ID, identifier, series, seriesIndex, authorFlag, titleFlag)
 }

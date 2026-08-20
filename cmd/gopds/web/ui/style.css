@@ -882,3 +882,18 @@ button {
     font-weight: 600;
     color: #ffd479;
 }
+
+/* Rescore feedback: a brief tint showing which way the score moved. */
+.review-score-up {
+    color: #6fcf97;
+}
+
+.review-score-down {
+    color: #e0918a;
+}
+
+/* A row whose issues have all cleared, kept visible until the queue reloads
+   so the user can see what their edit achieved. */
+.review-row-clear {
+    border-left: 3px solid #6fcf97;
+}

@@ -946,11 +946,19 @@ const App = {
             }
 
             const payload = await response.json();
-            this.coverVersion[this.coverModalBookId] = Date.now();
+            const bookId = this.coverModalBookId;
+            this.coverVersion[bookId] = Date.now();
             this.render(true);
             this.ui.coverModalStatus.textContent = payload.wrote_to_epub
                 ? 'Cover updated in cache and EPUB.'
                 : 'Cover cache updated.';
+
+            // If this came from the review queue, show the new art and the
+            // score it earns without making the user hunt for the row again.
+            if (this.returnToReview) {
+                this.refreshReviewRowCover(bookId);
+                await this.rescoreBookQuietly(bookId);
+            }
         } catch (err) {
             this.ui.coverModalStatus.textContent = `Error: ${err.message}`;
             console.error(err);
@@ -1065,6 +1073,9 @@ const App = {
             this.updateBookCardStateFromMetadata(updated);
             this.applyFiltersAndRender();
             this.ui.modalStatus.textContent = 'Saved to EPUB and DB cache.';
+            if (this.returnToReview) {
+                await this.rescoreBookQuietly(this.modalBookId);
+            }
             this.closeModal();
         } catch (err) {
             this.ui.modalStatus.textContent = `Error: ${err.message}`;
@@ -1565,8 +1576,9 @@ const App = {
                 .join('');
             return `
                 <div class="review-row" data-book-id="${b.id}">
-                    <img class="review-cover" src="/covers/${b.id}.jpg" alt=""
-                         loading="lazy" onerror="this.style.visibility='hidden'">
+                    <img class="review-cover" src="/covers/${b.id}.jpg?v=${this.coverVersion[b.id] || 0}" alt=""
+                         loading="lazy"
+                         onerror="this.onerror=null;this.src=App.COVER_PLACEHOLDER">
                     <div class="review-meta">
                         <div class="review-title">${this.escapeHTML(b.title || 'Untitled')}</div>
                         <div class="review-author">${this.escapeHTML(b.author || 'Unknown Author')}</div>
@@ -1576,6 +1588,7 @@ const App = {
                     <div class="review-actions">
                         <button type="button" data-review-edit="${b.id}">Edit</button>
                         <button type="button" data-review-cover="${b.id}">Cover</button>
+                        <button type="button" data-review-rescore="${b.id}" title="Re-check this book's metadata and cover, and update its quality score">Rescore</button>
                         <button type="button" data-review-resolve="${b.id}">Resolve</button>
                         <button type="button" data-review-lock="${b.id}" title="Resolve and never auto-touch this book">Lock</button>
                     </div>
@@ -1596,8 +1609,14 @@ const App = {
 
         const editId = target.dataset.reviewEdit;
         const coverId = target.dataset.reviewCover;
+        const rescoreId = target.dataset.reviewRescore;
         const resolveId = target.dataset.reviewResolve;
         const lockId = target.dataset.reviewLock;
+
+        if (rescoreId) {
+            await this.rescoreBook(rescoreId, target);
+            return;
+        }
 
         if (editId) {
             const book = this.findBookById(editId);
@@ -1633,6 +1652,102 @@ const App = {
                 console.error(err);
                 target.disabled = false;
             }
+        }
+    },
+
+    // Re-score a single book and update its row in place. Reloading the whole
+    // queue would lose the user's scroll position, and the row may legitimately
+    // stay in the list if issues remain.
+    async rescoreBook(id, button) {
+        const original = button.textContent;
+        button.disabled = true;
+        button.textContent = '...';
+        try {
+            const response = await fetch(`/api/admin/review/${id}/rescore`, { method: 'POST' });
+            if (!response.ok) {
+                throw new Error(await response.text());
+            }
+            const result = await response.json();
+            this.applyRescoreToRow(id, result);
+            this.loadQualitySummary();
+        } catch (err) {
+            console.error(err);
+            button.title = `Rescore failed: ${err.message}`;
+        } finally {
+            button.disabled = false;
+            button.textContent = original;
+        }
+    },
+
+    // Point a review row's thumbnail at the freshly written cover. The browser
+    // caches /covers/{id}.jpg aggressively, so the version query is what makes
+    // the new image actually appear.
+    refreshReviewRowCover(bookId) {
+        if (!this.ui.reviewList) {
+            return;
+        }
+        const row = this.ui.reviewList.querySelector(`.review-row[data-book-id="${bookId}"]`);
+        const img = row && row.querySelector('.review-cover');
+        if (!img) {
+            return;
+        }
+        img.onerror = () => { img.onerror = null; img.src = App.COVER_PLACEHOLDER; };
+        img.src = `/covers/${bookId}.jpg?v=${this.coverVersion[bookId] || 0}`;
+    },
+
+    // Rescore without a button to disable, used after an applied cover change.
+    async rescoreBookQuietly(id) {
+        try {
+            const response = await fetch(`/api/admin/review/${id}/rescore`, { method: 'POST' });
+            if (!response.ok) {
+                return;
+            }
+            this.applyRescoreToRow(id, await response.json());
+            this.loadQualitySummary();
+        } catch (err) {
+            console.error(err);
+        }
+    },
+
+    applyRescoreToRow(id, result) {
+        const row = this.ui.reviewList.querySelector(`.review-row[data-book-id="${id}"]`);
+        if (!row) {
+            return;
+        }
+
+        const scoreEl = row.querySelector('.review-score');
+        if (scoreEl) {
+            const previous = Number(scoreEl.textContent.trim());
+            scoreEl.textContent = result.quality;
+            scoreEl.classList.remove('review-score-up', 'review-score-down');
+            if (Number.isFinite(previous) && result.quality !== previous) {
+                scoreEl.classList.add(result.quality > previous ? 'review-score-up' : 'review-score-down');
+            }
+            scoreEl.title = Number.isFinite(previous) && result.quality !== previous
+                ? `Quality ${previous} -> ${result.quality}`
+                : `Quality ${result.quality}`;
+        }
+
+        const flagsEl = row.querySelector('.review-flags');
+        if (flagsEl) {
+            flagsEl.innerHTML = String(result.review_flags || '')
+                .split(',')
+                .filter(Boolean)
+                .map((f) => `<span class="review-flag">${this.escapeHTML(f)}</span>`)
+                .join('');
+        }
+
+        // Keep the cached item in sync so re-rendering does not revert the score.
+        const item = this.reviewItems.find((i) => String(i.book.id) === String(id));
+        if (item) {
+            item.quality = result.quality;
+            item.review_flags = result.review_flags || '';
+        }
+
+        if (!result.review_flags) {
+            row.classList.add('review-row-clear');
+        } else {
+            row.classList.remove('review-row-clear');
         }
     },
 

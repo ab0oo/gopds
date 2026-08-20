@@ -3,7 +3,9 @@
 package web
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -666,4 +668,65 @@ func (s *Server) gatherOnlineCovers(client *http.Client, bookID int, title, auth
 	}
 
 	return rankAndFilterOnlineCovers(client, candidates)
+}
+
+// HandleReviewRescore re-evaluates a single book's quality after metadata or
+// cover changes have been applied, and returns the fresh score so the review
+// row can be updated in place.
+func (s *Server) HandleReviewRescore(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	bookID, err := strconv.Atoi(strings.TrimSpace(id))
+	if err != nil {
+		http.Error(w, "Invalid book id", http.StatusBadRequest)
+		return
+	}
+
+	book, err := s.db.GetBookByID(id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "Book not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	// A locked book has been ruled on by a human; rescoring it would overwrite
+	// that decision with an automated one.
+	if existing, err := s.db.GetEnrichment(bookID); err == nil && existing != nil && existing.Locked {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			BookID  int    `json:"book_id"`
+			Quality int    `json:"quality"`
+			Flags   string `json:"review_flags"`
+			Locked  bool   `json:"locked"`
+			Skipped string `json:"skipped,omitempty"`
+		}{
+			BookID: bookID, Quality: existing.Quality, Flags: existing.ReviewFlags,
+			Locked: true, Skipped: "book is locked",
+		})
+		return
+	}
+
+	bookPath, err := s.resolveBookPath(book)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to locate EPUB: %v", err), http.StatusUnprocessableEntity)
+		return
+	}
+
+	q := scanner.RescoreBook(*book, bookPath)
+	flags := normalize.FlagsString(q.Flags)
+	if err := s.db.SaveEnrichmentScore(bookID, q.Score, flags); err != nil {
+		log.Printf("rescore save failed for %d: %v", bookID, err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		BookID  int    `json:"book_id"`
+		Quality int    `json:"quality"`
+		Flags   string `json:"review_flags"`
+		Locked  bool   `json:"locked"`
+	}{BookID: bookID, Quality: q.Score, Flags: flags, Locked: false})
 }
