@@ -17,7 +17,25 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
   build-image:
+    needs: test
     runs-on: ubuntu-latest
     env:
       SHOULD_PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release' }}
@@ -38,7 +56,7 @@ jobs:
             type=ref,event=branch
             type=ref,event=tag
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Log in to GHCR
         if: env.SHOULD_PUBLISH == 'true'
