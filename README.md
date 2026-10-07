@@ -42,8 +42,8 @@ All configuration is via environment variables.
 | `ADMIN_USERNAME` | `admin` | Admin username. |
 | `ADMIN_PASSWORD` | *(none)* | Required for authenticated features. If empty, all admin endpoints return 401. |
 | `CATEGORY_SOURCE` | `none` | How categories are derived: `path`, `subject`, `auto`, or `none`. See below. |
-| `ONLINE_COVER_MIN_WIDTH` | `300` | Online cover candidates narrower than this are discarded. |
-| `ONLINE_COVER_MIN_HEIGHT` | `420` | Online cover candidates shorter than this are discarded. |
+| `ONLINE_COVER_MIN_WIDTH` | `300` | Online cover candidates narrower than this are discarded. Wikipedia covers use a floor of 200, since fair-use images there are small. |
+| `ONLINE_COVER_MIN_HEIGHT` | `420` | Online cover candidates shorter than this are discarded. Wikipedia covers use a floor of 300. |
 | `ENRICH_RATE_MS` | `1000` | Milliseconds between upstream lookups during background enrichment. |
 | `LISTEN_ADDR` | `:8880` | Address the HTTP server binds to. |
 

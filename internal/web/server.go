@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/ab0oo/gopds/internal/database"
 	"github.com/ab0oo/gopds/internal/scanner"
@@ -1528,17 +1529,10 @@ func (s *Server) HandleOnlineCoverCandidates(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	wikiQueries := make([]string, 0, 2)
-	if query != "" {
-		wikiQueries = append(wikiQueries, query)
-	}
 	if title != "" {
-		wikiQueries = append(wikiQueries, strings.TrimSpace(title+" book"))
-	}
-	for _, q := range wikiQueries {
-		wiki, err := fetchWikipediaCoverCandidates(client, q, 6)
+		wiki, err := fetchWikipediaCoverCandidates(client, title, author, 6)
 		if err == nil {
-			log.Printf("[covers.online] wikipedia candidates book_id=%d query=%q count=%d", book.ID, q, len(wiki))
+			log.Printf("[covers.online] wikipedia candidates book_id=%d title=%q count=%d", book.ID, title, len(wiki))
 			for _, c := range wiki {
 				if _, ok := seen[c.ImageURL]; ok {
 					continue
@@ -1547,7 +1541,7 @@ func (s *Server) HandleOnlineCoverCandidates(w http.ResponseWriter, r *http.Requ
 				candidates = append(candidates, c)
 			}
 		} else {
-			log.Printf("[covers.online] wikipedia error book_id=%d query=%q err=%v", book.ID, q, err)
+			log.Printf("[covers.online] wikipedia error book_id=%d title=%q err=%v", book.ID, title, err)
 		}
 	}
 
@@ -1818,37 +1812,78 @@ type wikiSummaryResponse struct {
 	} `json:"originalimage"`
 }
 
-func fetchWikipediaCoverCandidates(client *http.Client, query string, limit int) ([]coverCandidate, error) {
+type wikiSearchResponse struct {
+	Query struct {
+		Search []struct {
+			Title string `json:"title"`
+		} `json:"search"`
+	} `json:"query"`
+}
+
+// fetchWikipediaCoverCandidates looks for the Wikipedia article about this
+// specific book and returns its lead image.
+//
+// Two lookups feed it. opensearch is a *title prefix* match, so it must be
+// given the bare book title: appending the author or the word "book" makes it
+// match nothing. Full-text search copes with the author in the query and finds
+// articles titled like "Foo (novel)", but also returns the author's own page
+// and sibling books, so every hit is checked against the book title before its
+// image is accepted.
+func fetchWikipediaCoverCandidates(client *http.Client, bookTitle, author string, limit int) ([]coverCandidate, error) {
 	if limit <= 0 {
 		limit = 6
 	}
-	opensearchURL := "https://en.wikipedia.org/w/api.php?action=opensearch&format=json&namespace=0&limit=" + strconv.Itoa(limit) + "&search=" + url.QueryEscape(query)
+	bookTitle = strings.TrimSpace(bookTitle)
+	if bookTitle == "" {
+		return nil, nil
+	}
+
+	pages := make([]string, 0, limit*2)
+	var firstErr error
+
+	opensearchURL := "https://en.wikipedia.org/w/api.php?action=opensearch&format=json&namespace=0&limit=" + strconv.Itoa(limit) + "&search=" + url.QueryEscape(bookTitle)
 	var raw wikiOpenSearchResponse
 	if err := fetchJSON(client, opensearchURL, &raw); err != nil {
-		return nil, err
-	}
-	if len(raw) < 2 {
-		return nil, nil
-	}
-
-	titlesAny, ok := raw[1].([]any)
-	if !ok {
-		return nil, nil
-	}
-
-	out := make([]coverCandidate, 0, len(titlesAny))
-	seen := map[string]struct{}{}
-	for _, v := range titlesAny {
-		title, ok := v.(string)
-		if !ok {
-			continue
+		firstErr = err
+	} else if len(raw) >= 2 {
+		if titlesAny, ok := raw[1].([]any); ok {
+			for _, v := range titlesAny {
+				if t, ok := v.(string); ok {
+					pages = append(pages, t)
+				}
+			}
 		}
+	}
+
+	searchURL := "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srnamespace=0&srlimit=" + strconv.Itoa(limit) + "&srsearch=" + url.QueryEscape(strings.TrimSpace(bookTitle+" "+author))
+	var search wikiSearchResponse
+	if err := fetchJSON(client, searchURL, &search); err != nil {
+		if firstErr != nil {
+			return nil, firstErr
+		}
+	} else {
+		for _, hit := range search.Query.Search {
+			pages = append(pages, hit.Title)
+		}
+	}
+
+	out := make([]coverCandidate, 0, len(pages))
+	seenPage := map[string]struct{}{}
+	seen := map[string]struct{}{}
+	for _, title := range pages {
 		title = strings.TrimSpace(title)
 		if title == "" {
 			continue
 		}
+		if _, ok := seenPage[title]; ok {
+			continue
+		}
+		seenPage[title] = struct{}{}
+		if !wikiPageMatchesBook(title, bookTitle, author) {
+			continue
+		}
 
-		summaryURL := "https://en.wikipedia.org/api/rest_v1/page/summary/" + url.PathEscape(title)
+		summaryURL := "https://en.wikipedia.org/api/rest_v1/page/summary/" + url.PathEscape(strings.ReplaceAll(title, " ", "_"))
 		var summary wikiSummaryResponse
 		if err := fetchJSON(client, summaryURL, &summary); err != nil {
 			continue
@@ -1874,6 +1909,72 @@ func fetchWikipediaCoverCandidates(client *http.Client, query string, limit int)
 		out = append(out, makeRemoteCoverCandidate(imageURL, firstNonEmpty([]string{summary.Title, title}), "wikipedia"))
 	}
 	return out, nil
+}
+
+// wikiPageMatchesBook reports whether a Wikipedia article title names this
+// book. The article title must equal the book title; a disambiguating suffix
+// is accepted only when it marks the page as a book or names the author, so
+// "Temple of the Winds (building)" is not mistaken for the novel.
+func wikiPageMatchesBook(pageTitle, bookTitle, author string) bool {
+	base, qualifier := strings.TrimSpace(pageTitle), ""
+	if i := strings.LastIndex(base, " ("); i > 0 && strings.HasSuffix(base, ")") {
+		qualifier = strings.ToLower(base[i+2 : len(base)-1])
+		base = base[:i]
+	}
+	base = wikiCompareKey(base)
+	if base == "" {
+		return false
+	}
+
+	// EPUB titles often carry a subtitle or series tag the article title lacks.
+	want := []string{bookTitle}
+	if i := strings.Index(bookTitle, ":"); i > 0 {
+		want = append(want, bookTitle[:i])
+	}
+	if i := strings.Index(bookTitle, "("); i > 0 {
+		want = append(want, bookTitle[:i])
+	}
+	matched := false
+	for _, w := range want {
+		if wikiCompareKey(w) == base {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return false
+	}
+	if qualifier == "" {
+		return true
+	}
+
+	for _, word := range []string{"novel", "book", "novella", "short story", "collection", "anthology", "memoir", "play"} {
+		if strings.Contains(qualifier, word) {
+			return true
+		}
+	}
+	for _, tok := range strings.Fields(wikiCompareKey(author)) {
+		if len(tok) > 2 && strings.Contains(wikiCompareKey(qualifier), tok) {
+			return true
+		}
+	}
+	return false
+}
+
+// wikiCompareKey lowercases and strips punctuation so titles compare loosely.
+func wikiCompareKey(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			b.WriteRune(r)
+		case r == '\'' || r == '\u2019':
+			// drop apostrophes so "Wizard's" == "Wizards"
+		default:
+			b.WriteByte(' ')
+		}
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
 }
 
 func makeRemoteCoverCandidate(imageURL, name, source string) coverCandidate {
@@ -2088,6 +2189,11 @@ func fetchAllowedRemoteImage(raw string) ([]byte, error) {
 	return b, nil
 }
 
+const (
+	wikipediaCoverMinWidth  = 200
+	wikipediaCoverMinHeight = 300
+)
+
 func rankAndFilterOnlineCovers(client *http.Client, in []coverCandidate) []coverCandidate {
 	minW := envIntDefault("ONLINE_COVER_MIN_WIDTH", 300)
 	minH := envIntDefault("ONLINE_COVER_MIN_HEIGHT", 420)
@@ -2104,7 +2210,15 @@ func rankAndFilterOnlineCovers(client *http.Client, in []coverCandidate) []cover
 			c.Width = w
 			c.Height = h
 		}
-		if c.Width > 0 && c.Height > 0 && (c.Width < minW || c.Height < minH) {
+		floorW, floorH := minW, minH
+		if c.Source == "wikipedia" {
+			// Wikipedia hosts book covers under fair use, which caps them at
+			// roughly 260x385. Holding them to the general minimum discards
+			// every one, so they get their own floor; they are title-matched
+			// and still rank below the larger sources.
+			floorW, floorH = min(minW, wikipediaCoverMinWidth), min(minH, wikipediaCoverMinHeight)
+		}
+		if c.Width > 0 && c.Height > 0 && (c.Width < floorW || c.Height < floorH) {
 			continue
 		}
 		out = append(out, c)
