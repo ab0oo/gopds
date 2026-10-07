@@ -269,6 +269,8 @@ func (s *Server) Router() http.Handler {
 	r.Get("/api/books/{id}/covers/online", s.requireAuth(s.HandleOnlineCoverCandidates))
 	r.Get("/api/books/{id}/covers/candidates/{key}", s.requireAuth(s.HandleCoverCandidateImage))
 	r.Put("/api/books/{id}/cover", s.requireAuth(s.HandleUpdateCover))
+	r.Get("/api/books/{id}/series/lookup", s.requireAuth(s.HandleSeriesLookup))
+	r.Post("/api/admin/series/apply", s.requireAuth(s.HandleSeriesApply))
 	r.Post("/api/admin/rebuild", s.requireAuth(s.HandleRebuildLibrary))
 	r.Post("/api/admin/rescan", s.requireAuth(s.HandleRescanLibrary))
 	r.Get("/api/admin/rebuild/status", s.requireAuth(s.HandleRebuildStatus))
@@ -1376,6 +1378,14 @@ func (s *Server) HandleUpdateMetadata(w http.ResponseWriter, r *http.Request) {
 	if err := s.db.UpdateBookMetadata(book.ID, title, author, description, info.ModTime()); err != nil {
 		http.Error(w, "Failed to update metadata cache", http.StatusInternalServerError)
 		return
+	}
+	// Series lives in its own columns; without this an edited series stays
+	// stale in the cache, since the refreshed mod time makes rescans skip it.
+	if meta != nil {
+		if err := s.db.UpdateBookSeries(book.ID, strings.TrimSpace(meta.Series), strings.TrimSpace(meta.SeriesIndex), info.ModTime()); err != nil {
+			http.Error(w, "Failed to update metadata cache", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

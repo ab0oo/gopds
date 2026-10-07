@@ -169,6 +169,17 @@ func (db *DB) UpdateBookMetadata(id int, title, author, description string, modT
 	return err
 }
 
+// UpdateBookSeries records a book's series membership. modTime should be the
+// EPUB's new mod time so the next incremental scan does not re-read the file.
+func (db *DB) UpdateBookSeries(id int, series, seriesIndex string, modTime time.Time) error {
+	query := `
+	UPDATE books
+	SET series = ?, series_index = ?, mod_time = ?
+	WHERE id = ?`
+	_, err := db.conn.Exec(query, series, seriesIndex, modTime, id)
+	return err
+}
+
 func (db *DB) UpdateBookPath(id int, path string) error {
 	query := `
 	UPDATE books
