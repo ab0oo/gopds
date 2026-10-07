@@ -132,6 +132,11 @@ const App = {
                         <span>Apply</span>
                     </div>
                     <div class="field-table-body">${fieldRows}</div>
+                    <div class="series-tools">
+                        <button type="button" id="series-find" title="Look this book up on Wikidata and tag the other books of its series">Find Series Books</button>
+                        <div class="edit-status" id="series-status"></div>
+                    </div>
+                    <div id="series-results" class="series-results"></div>
                     <div class="modal-actions">
                         <button type="submit" id="modal-save">Save All Fields to EPUB</button>
                         <div class="edit-status" id="modal-status"></div>
@@ -152,6 +157,9 @@ const App = {
         this.ui.olFetch = modal.querySelector('#ol-fetch');
         this.ui.olStatus = modal.querySelector('#ol-status');
         this.ui.olResults = modal.querySelector('#ol-results');
+        this.ui.seriesFind = modal.querySelector('#series-find');
+        this.ui.seriesStatus = modal.querySelector('#series-status');
+        this.ui.seriesResults = modal.querySelector('#series-results');
         this.ui.fieldInputs = {};
         FIELDS.forEach((f) => {
             this.ui.fieldInputs[f.key] = modal.querySelector(`[data-field="${f.key}"]`);
@@ -199,8 +207,15 @@ const App = {
             if (selectBtn) {
                 const idx = Number(selectBtn.dataset.resultIndex);
                 this.selectOpenLibraryResult(idx);
+                return;
+            }
+
+            const seriesApply = e.target.closest('[data-series-apply]');
+            if (seriesApply) {
+                this.applySeriesProposal(seriesApply.closest('.series-block'));
             }
         });
+        this.ui.seriesFind.addEventListener('click', () => this.findSeriesBooks());
 
         this.ui.modalClose.addEventListener('click', () => this.closeModal());
         this.ui.modalForm.addEventListener('submit', (e) => this.handleMetadataSubmit(e));
@@ -980,6 +995,8 @@ const App = {
         this.ui.modalStatus.textContent = 'Loading metadata directly from EPUB...';
         this.ui.olStatus.textContent = 'Fetch Open Library results to compare fields.';
         this.ui.olResults.innerHTML = '';
+        this.ui.seriesStatus.textContent = '';
+        this.ui.seriesResults.innerHTML = '';
 
         const query = [book.title, book.author].filter(Boolean).join(' ').trim();
         this.ui.olQuery.value = query;
@@ -1208,7 +1225,9 @@ const App = {
                 ...b,
                 title: meta.title || b.title,
                 author: meta.author || b.author,
-                description: meta.description || b.description
+                description: meta.description || b.description,
+                series: meta.series || '',
+                series_index: meta.series_index || ''
             };
         });
         this.filteredBooks = this.filteredBooks.map((b) => {
@@ -1219,9 +1238,189 @@ const App = {
                 ...b,
                 title: meta.title || b.title,
                 author: meta.author || b.author,
-                description: meta.description || b.description
+                description: meta.description || b.description,
+                series: meta.series || '',
+                series_index: meta.series_index || ''
             };
         });
+    },
+
+    // findSeriesBooks asks the server which series this book belongs to and
+    // which other library books are volumes of it. Nothing is written here;
+    // the result is a proposal the user confirms per series.
+    async findSeriesBooks() {
+        if (!this.modalBookId) {
+            return;
+        }
+        const bookId = this.modalBookId;
+        const params = new URLSearchParams({
+            title: (this.ui.fieldInputs.title.value || '').trim(),
+            author: (this.ui.fieldInputs.author.value || '').trim()
+        });
+        this.ui.seriesFind.disabled = true;
+        this.ui.seriesResults.innerHTML = '';
+        this.ui.seriesStatus.textContent = 'Looking up series on Wikidata...';
+
+        try {
+            const response = await fetch(`/api/books/${bookId}/series/lookup?${params}`);
+            if (!response.ok) {
+                if (response.status === 401) {
+                    await this.syncAuthStatus();
+                }
+                const msg = await response.text();
+                throw new Error(msg || `Series lookup failed (${response.status})`);
+            }
+            const data = await response.json();
+            if (this.modalBookId !== bookId) {
+                return;
+            }
+            const series = Array.isArray(data.series) ? data.series : [];
+            if (!series.length) {
+                this.ui.seriesStatus.textContent = 'Wikidata lists no series for this title and author.';
+                return;
+            }
+            this.ui.seriesStatus.textContent = series.length > 1
+                ? `This book belongs to ${series.length} series. Apply the one you want.`
+                : 'Review the matches, then apply.';
+            this.renderSeriesProposals(series);
+        } catch (err) {
+            this.ui.seriesStatus.textContent = `Error: ${err.message}`;
+            console.error(err);
+        } finally {
+            this.ui.seriesFind.disabled = false;
+        }
+    },
+
+    renderSeriesProposals(series) {
+        // A series name already typed into the editor wins over Wikidata's,
+        // but only when there is a single series it could refer to.
+        const typedName = (this.ui.fieldInputs.series.value || '').trim();
+
+        this.ui.seriesResults.innerHTML = series.map((p) => {
+            const entries = Array.isArray(p.entries) ? p.entries : [];
+            const name = series.length === 1 && typedName ? typedName : p.name;
+            const rows = entries.map((entry) => {
+                const index = this.formatSeriesIndex(entry.index);
+                const matches = Array.isArray(entry.matches) ? entry.matches : [];
+                if (!matches.length) {
+                    return `
+                        <div class="series-row series-row-missing">
+                            <span></span>
+                            <span class="series-row-index">${this.escapeHTML(index)}</span>
+                            <span>${this.escapeHTML(entry.title)}</span>
+                            <span class="series-row-local">Not in library</span>
+                        </div>`;
+                }
+                return matches.map((m) => {
+                    const current = m.series
+                        ? `${m.series}${m.series_index ? ' #' + this.formatSeriesIndex(m.series_index) : ''}`
+                        : 'no series';
+                    // Volumes Wikidata gives no position for start unchecked:
+                    // there is no index to write until the user supplies one.
+                    return `
+                        <div class="series-row">
+                            <input type="checkbox" data-series-book="${m.book_id}" ${index ? 'checked' : ''} aria-label="Apply to ${this.escapeHTML(m.title)}">
+                            <input class="series-row-index" data-series-index value="${this.escapeHTML(index)}" aria-label="Series index">
+                            <span>${this.escapeHTML(entry.title)}</span>
+                            <span class="series-row-local">#${m.book_id} ${this.escapeHTML(m.title)} <em>(${this.escapeHTML(current)})</em></span>
+                        </div>`;
+                }).join('');
+            }).join('');
+
+            return `
+                <div class="series-block">
+                    <div class="series-block-head">
+                        <label>Series name <input data-series-name value="${this.escapeHTML(name)}"></label>
+                        <span class="edit-status">${p.matched} in library, ${entries.length} in series</span>
+                    </div>
+                    <div class="series-rows">
+                        <div class="series-row series-row-head">
+                            <span></span><span>#</span><span>Volume</span><span>Library book (current series)</span>
+                        </div>
+                        ${rows}
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" data-series-apply="1">Write Series to Checked Books</button>
+                        <div class="edit-status" data-series-apply-status></div>
+                    </div>
+                </div>`;
+        }).join('');
+    },
+
+    async applySeriesProposal(block) {
+        if (!block) {
+            return;
+        }
+        const status = block.querySelector('[data-series-apply-status]');
+        const button = block.querySelector('[data-series-apply]');
+        const name = (block.querySelector('[data-series-name]').value || '').trim();
+        const items = [];
+        let missingIndex = false;
+        block.querySelectorAll('[data-series-book]:checked').forEach((box) => {
+            const index = (box.closest('.series-row').querySelector('[data-series-index]').value || '').trim();
+            if (!index) {
+                missingIndex = true;
+            }
+            items.push({ book_id: Number(box.dataset.seriesBook), series_index: index });
+        });
+
+        if (!name) {
+            status.textContent = 'Enter a series name.';
+            return;
+        }
+        if (!items.length) {
+            status.textContent = 'No books are checked.';
+            return;
+        }
+        if (missingIndex) {
+            status.textContent = 'Give every checked book an index, or uncheck it.';
+            return;
+        }
+
+        button.disabled = true;
+        status.textContent = `Writing series to ${items.length} EPUB${items.length === 1 ? '' : 's'}...`;
+        try {
+            const response = await fetch('/api/admin/series/apply', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ series: name, items })
+            });
+            if (!response.ok) {
+                if (response.status === 401) {
+                    await this.syncAuthStatus();
+                }
+                const msg = await response.text();
+                throw new Error(msg || `Series update failed (${response.status})`);
+            }
+            const data = await response.json();
+            const results = Array.isArray(data.results) ? data.results : [];
+            const done = {};
+            results.filter((r) => r.ok).forEach((r) => { done[r.book_id] = r; });
+            const failed = results.filter((r) => !r.ok);
+
+            const patch = (b) => (done[b.id]
+                ? { ...b, series: done[b.id].series, series_index: done[b.id].series_index }
+                : b);
+            this.allBooks = this.allBooks.map(patch);
+            this.filteredBooks = this.filteredBooks.map(patch);
+
+            // Keep the open editor in step, or a later "Save All Fields"
+            // would write the old series value back over this one.
+            if (this.modalBookId && done[this.modalBookId]) {
+                this.ui.fieldInputs.series.value = done[this.modalBookId].series;
+                this.ui.fieldInputs.series_index.value = done[this.modalBookId].series_index;
+            }
+            this.applyFiltersAndRender();
+
+            status.textContent = failed.length
+                ? `Updated ${data.updated} of ${results.length}. Failed: ${failed.map((r) => `#${r.book_id} (${r.error})`).join('; ')}`
+                : `Updated ${data.updated} book${data.updated === 1 ? '' : 's'}.`;
+        } catch (err) {
+            status.textContent = `Error: ${err.message}`;
+            console.error(err);
+        } finally {
+            button.disabled = false;
+        }
     },
 
     render(reset = false) {

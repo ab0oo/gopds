@@ -897,3 +897,115 @@ button {
 .review-row-clear {
     border-left: 3px solid #6fcf97;
 }
+
+/* --- Series lookup inside the metadata editor --- */
+.series-tools {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 6px;
+}
+
+.series-results {
+    display: grid;
+    gap: 10px;
+}
+
+.series-block {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    background: #10171f;
+}
+
+.series-block-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+
+.series-block-head label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+}
+
+.series-block input:not([type="checkbox"]) {
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: #0c1218;
+    color: var(--text-main);
+    padding: 5px 7px;
+}
+
+.series-block input[type="checkbox"] {
+    accent-color: var(--accent);
+}
+
+.series-rows {
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.series-row {
+    display: grid;
+    grid-template-columns: 22px 56px minmax(0, 1fr) minmax(0, 1.3fr);
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+    font-size: 0.85rem;
+}
+
+.series-row .series-row-index {
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.series-row-head,
+.series-row-local,
+.series-row-missing {
+    color: var(--text-muted);
+}
+
+.series-row-head {
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.series-row-missing {
+    opacity: 0.6;
+}
+
+.series-tools button,
+.series-block button {
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: #12212e;
+    color: var(--text-main);
+    padding: 7px 12px;
+    font-size: 0.84rem;
+    cursor: pointer;
+}
+
+.series-tools button:hover,
+.series-block button:hover {
+    background: #172c3c;
+    border-color: var(--accent);
+}
+
+.series-tools button:disabled,
+.series-block button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.series-block button[data-series-apply] {
+    border-color: rgba(91, 192, 190, 0.4);
+    background: rgba(91, 192, 190, 0.14);
+    color: var(--accent);
+}

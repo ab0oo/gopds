@@ -20,6 +20,8 @@ It builds to a single static binary (pure-Go SQLite, no CGO) and ships as a ~21M
 - Authenticated admin editing:
   - Live EPUB metadata edit/write
   - Open Library + Google Books compare/apply workflow
+  - Series tagging: look one book up on Wikidata, then write the series name and
+    each volume's index to every matching book in the library after review
   - Cover candidate selection and apply, from inside the EPUB or from online sources
   - Optional write selected cover into EPUB (`write_to_epub`)
   - Rebuild/rescan controls
@@ -142,6 +144,8 @@ Admin-protected:
 - `GET /api/books/{id}/covers/online`
 - `GET /api/books/{id}/covers/candidates/{key}`
 - `PUT /api/books/{id}/cover`
+- `GET /api/books/{id}/series/lookup`
+- `POST /api/admin/series/apply`
 - `POST /api/admin/rescan`
 - `POST /api/admin/rebuild`
 - `GET /api/admin/rebuild/status`

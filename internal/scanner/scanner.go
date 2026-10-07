@@ -168,6 +168,41 @@ func ExtractLiveMetadata(epubPath string) (*EPUBMetadata, error) {
 }
 
 func UpdateEPUBMetadata(epubPath string, update MetadataUpdate) (*EPUBMetadata, error) {
+	return rewriteEPUBOPF(epubPath, func(opf []byte) ([]byte, error) {
+		return rewriteOPFMetadata(opf, update)
+	})
+}
+
+// UpdateEPUBSeries writes only the series fields, leaving every other piece of
+// metadata in the EPUB exactly as it was. Empty values remove the tags.
+func UpdateEPUBSeries(epubPath, series, seriesIndex string) (*EPUBMetadata, error) {
+	return rewriteEPUBOPF(epubPath, func(opf []byte) ([]byte, error) {
+		return rewriteOPFSeries(opf, series, seriesIndex)
+	})
+}
+
+func rewriteOPFSeries(opfContent []byte, series, seriesIndex string) ([]byte, error) {
+	metadataInner, start, end, err := metadataInnerBlock(opfContent)
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy first: setMetaNameContent appends, and metadataInner aliases the
+	// OPF buffer, so appending in place would overwrite the bytes that follow.
+	newInner := append([]byte(nil), metadataInner...)
+	newInner, _ = setMetaNameContent(newInner, "calibre:series", series, false)
+	newInner, _ = setMetaNameContent(newInner, "calibre:series_index", seriesIndex, false)
+
+	result := make([]byte, 0, len(opfContent)-len(metadataInner)+len(newInner))
+	result = append(result, opfContent[:start]...)
+	result = append(result, newInner...)
+	result = append(result, opfContent[end:]...)
+	return result, nil
+}
+
+// rewriteEPUBOPF rebuilds the EPUB with its OPF document passed through
+// rewrite, replacing the original atomically.
+func rewriteEPUBOPF(epubPath string, rewrite func([]byte) ([]byte, error)) (*EPUBMetadata, error) {
 	reader, err := zip.OpenReader(epubPath)
 	if err != nil {
 		return nil, err
@@ -218,7 +253,7 @@ func UpdateEPUBMetadata(epubPath string, update MetadataUpdate) (*EPUBMetadata, 
 				return nil, err
 			}
 
-			updatedContent, err := rewriteOPFMetadata(opfContent, update)
+			updatedContent, err := rewrite(opfContent)
 			if err != nil {
 				_ = writer.Close()
 				return nil, err
