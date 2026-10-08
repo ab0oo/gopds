@@ -256,6 +256,7 @@ func (s *Server) Router() http.Handler {
 
 	r.Get("/opds", s.HandleCatalog)
 	r.Get("/opds/authors", s.HandleAuthorsCatalog)
+	r.Get("/opds/series", s.HandleSeriesCatalog)
 	r.Get("/opds/categories", s.HandleCategoriesCatalog)
 	r.Get("/", s.HandleRoot)
 	r.Get("/favicon.ico", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
@@ -328,6 +329,111 @@ func (s *Server) HandleAuthorsCatalog(w http.ResponseWriter, r *http.Request) {
 	s.handleCatalogNavigation(w, r)
 }
 
+func (s *Server) HandleSeriesCatalog(w http.ResponseWriter, r *http.Request) {
+	series := strings.TrimSpace(r.URL.Query().Get("series"))
+	if series == "" {
+		s.handleSeriesNavigation(w, r)
+		return
+	}
+	s.handleSeriesBooksFeed(w, r, series)
+}
+
+func (s *Server) handleSeriesNavigation(w http.ResponseWriter, r *http.Request) {
+	counts, err := s.db.GetSeriesCounts()
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/atom+xml;profile=opds-catalog;kind=navigation;charset=utf-8")
+	fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">`)
+	fmt.Fprint(w, `<title>GoPDS Library - Series</title><id>gopds:series</id>`)
+	fmt.Fprintf(w, `<updated>%s</updated>`, time.Now().UTC().Format(time.RFC3339))
+	fmt.Fprint(w, `<link rel="self" href="/opds/series" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>`)
+	fmt.Fprint(w, `<link rel="start" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>`)
+
+	keys := make([]string, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return strings.ToLower(keys[i]) < strings.ToLower(keys[j]) })
+
+	for _, seriesName := range keys {
+		count := counts[seriesName]
+		href := fmt.Sprintf("/opds/series?series=%s&page=1&limit=100", url.QueryEscape(seriesName))
+		fmt.Fprintf(w, `    <entry>
+        <title>%s (%d)</title>
+        <id>gopds:series:%s</id>
+        <link rel="subsection" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+    </entry>`, html.EscapeString(seriesName), count, html.EscapeString(strings.ToLower(seriesName)), html.EscapeString(href))
+	}
+	fmt.Fprint(w, `</feed>`)
+}
+
+func (s *Server) handleSeriesBooksFeed(w http.ResponseWriter, r *http.Request, seriesName string) {
+	page := parseIntDefault(r.URL.Query().Get("page"), 1)
+	if page < 1 {
+		page = 1
+	}
+	limit := parseIntDefault(r.URL.Query().Get("limit"), 100)
+	if limit < 1 {
+		limit = 100
+	}
+	if limit > 250 {
+		limit = 250
+	}
+
+	total, err := s.db.CountBooksBySeries(seriesName) // Assumes DB helper
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	lastPage := 1
+	if total > 0 {
+		lastPage = (total + limit - 1) / limit
+	}
+	if page > lastPage {
+		page = lastPage
+	}
+	offset := (page - 1) * limit
+
+	books, err := s.db.GetBooksBySeries(seriesName, limit, offset) // Assumes DB helper
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	base := fmt.Sprintf("/opds/series?series=%s&limit=%d", url.QueryEscape(seriesName), limit)
+	self := fmt.Sprintf("%s&page=%d", base, page)
+	first := fmt.Sprintf("%s&page=1", base)
+	last := fmt.Sprintf("%s&page=%d", base, lastPage)
+
+	w.Header().Set("Content-Type", "application/atom+xml;profile=opds-catalog;kind=acquisition;charset=utf-8")
+	fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">`)
+	fmt.Fprintf(w, `<title>GoPDS Library - Series: %s (%d)</title>`, html.EscapeString(seriesName), total)
+	fmt.Fprintf(w, `<id>gopds:series:%s:%d</id>`, html.EscapeString(strings.ToLower(seriesName)), page)
+	fmt.Fprintf(w, `<updated>%s</updated>`, time.Now().UTC().Format(time.RFC3339))
+	fmt.Fprintf(w, `<link rel="self" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(self))
+	fmt.Fprint(w, `<link rel="up" href="/opds/series" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>`)
+	fmt.Fprintf(w, `<link rel="first" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(first))
+	fmt.Fprintf(w, `<link rel="last" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(last))
+
+	if page > 1 {
+		prev := fmt.Sprintf("%s&page=%d", base, page-1)
+		fmt.Fprintf(w, `<link rel="previous" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(prev))
+	}
+	if page < lastPage {
+		next := fmt.Sprintf("%s&page=%d", base, page+1)
+		fmt.Fprintf(w, `<link rel="next" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`, html.EscapeString(next))
+	}
+
+	for _, b := range books {
+		writeOPDSEntry(w, b)
+	}
+	fmt.Fprint(w, `</feed>`)
+}
+
 func (s *Server) HandleCategoriesCatalog(w http.ResponseWriter, r *http.Request) {
 	category := strings.TrimSpace(r.URL.Query().Get("category"))
 	subcategory := strings.TrimSpace(r.URL.Query().Get("subcategory"))
@@ -371,6 +477,19 @@ func (s *Server) handleCatalogNavigation(w http.ResponseWriter, r *http.Request)
         <id>gopds:authors:%s</id>
         <link rel="subsection" href="%s" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
     </entry>`, html.EscapeString(b.Label), count, html.EscapeString(b.Selector), html.EscapeString(href))
+	}
+	seriesCounts, err := s.db.GetSeriesCounts()
+	if err == nil && len(seriesCounts) > 0 {
+		total := 0
+		for _, c := range seriesCounts {
+			total += c
+		}
+		fmt.Fprintf(w, `
+	<entry>
+        <title>Browse by Series (%d)</title>
+        <id>gopds:series</id>
+        <link rel="subsection" href="/opds/series" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+    </entry>`, total)
 	}
 	categoryCounts, err := s.db.GetCategoryCounts()
 	if err == nil && len(categoryCounts) > 0 {
