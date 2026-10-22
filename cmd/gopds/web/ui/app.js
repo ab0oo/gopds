@@ -134,6 +134,7 @@ const App = {
                     <div class="field-table-body">${fieldRows}</div>
                     <div class="series-tools">
                         <button type="button" id="series-find" title="Look this book up on Wikidata and tag the other books of its series">Find Series Books</button>
+                        <button type="button" id="series-cleanup" title="Fix titles, authors and series numbering for every book in this series, checked against Wikidata">Clean Up Series</button>
                         <div class="edit-status" id="series-status"></div>
                     </div>
                     <div id="series-results" class="series-results"></div>
@@ -158,6 +159,7 @@ const App = {
         this.ui.olStatus = modal.querySelector('#ol-status');
         this.ui.olResults = modal.querySelector('#ol-results');
         this.ui.seriesFind = modal.querySelector('#series-find');
+        this.ui.seriesCleanup = modal.querySelector('#series-cleanup');
         this.ui.seriesStatus = modal.querySelector('#series-status');
         this.ui.seriesResults = modal.querySelector('#series-results');
         this.ui.fieldInputs = {};
@@ -213,9 +215,16 @@ const App = {
             const seriesApply = e.target.closest('[data-series-apply]');
             if (seriesApply) {
                 this.applySeriesProposal(seriesApply.closest('.series-block'));
+                return;
+            }
+
+            const cleanupApply = e.target.closest('[data-cleanup-apply]');
+            if (cleanupApply) {
+                this.applySeriesCleanup(cleanupApply.closest('.series-block'));
             }
         });
         this.ui.seriesFind.addEventListener('click', () => this.findSeriesBooks());
+        this.ui.seriesCleanup.addEventListener('click', () => this.findSeriesCleanup());
 
         this.ui.modalClose.addEventListener('click', () => this.closeModal());
         this.ui.modalForm.addEventListener('submit', (e) => this.handleMetadataSubmit(e));
@@ -333,7 +342,7 @@ const App = {
         }
 
         const confirmed = window.confirm(
-            'This will delete the book cache database and covers cache, then rebuild everything from disk. Continue?'
+            'This will re-read every book from disk, rebuild the covers cache, and remove books whose files are gone. Review decisions and locks are kept. Continue?'
         );
         if (!confirmed) {
             return;
@@ -1134,13 +1143,14 @@ const App = {
             this.selectedOpenLibrary = null;
             this.clearRemoteFieldColumn();
 
+            const notice = payload.notice ? ` ${payload.notice}` : '';
             if (this.openLibraryResults.length === 0) {
-                this.ui.olStatus.textContent = 'No results found.';
+                this.ui.olStatus.textContent = `No results found.${notice}`;
                 this.ui.olResults.innerHTML = '';
                 return;
             }
 
-            this.ui.olStatus.textContent = `Showing ${this.openLibraryResults.length} of ${payload.num_found || this.openLibraryResults.length} results.`;
+            this.ui.olStatus.textContent = `Showing ${this.openLibraryResults.length} of ${payload.num_found || this.openLibraryResults.length} results.${notice}`;
             this.renderOpenLibraryResults();
             this.selectOpenLibraryResult(0);
         } catch (err) {
@@ -1410,6 +1420,193 @@ const App = {
                 this.ui.fieldInputs.series.value = done[this.modalBookId].series;
                 this.ui.fieldInputs.series_index.value = done[this.modalBookId].series_index;
             }
+            this.applyFiltersAndRender();
+
+            status.textContent = failed.length
+                ? `Updated ${data.updated} of ${results.length}. Failed: ${failed.map((r) => `#${r.book_id} (${r.error})`).join('; ')}`
+                : `Updated ${data.updated} book${data.updated === 1 ? '' : 's'}.`;
+        } catch (err) {
+            status.textContent = `Error: ${err.message}`;
+            console.error(err);
+        } finally {
+            button.disabled = false;
+        }
+    },
+
+    // findSeriesCleanup asks the server how every book of this series should
+    // be titled, credited and numbered. Nothing is written until the user
+    // applies the checked rows.
+    async findSeriesCleanup() {
+        if (!this.modalBookId) {
+            return;
+        }
+        const bookId = this.modalBookId;
+        const params = new URLSearchParams({
+            title: (this.ui.fieldInputs.title.value || '').trim(),
+            author: (this.ui.fieldInputs.author.value || '').trim()
+        });
+        this.ui.seriesCleanup.disabled = true;
+        this.ui.seriesResults.innerHTML = '';
+        this.ui.seriesStatus.textContent = 'Checking the series against Wikidata...';
+
+        try {
+            const response = await fetch(`/api/books/${bookId}/series/cleanup?${params}`);
+            if (!response.ok) {
+                if (response.status === 401) {
+                    await this.syncAuthStatus();
+                }
+                const msg = await response.text();
+                throw new Error(msg || `Series cleanup failed (${response.status})`);
+            }
+            const data = await response.json();
+            if (this.modalBookId !== bookId) {
+                return;
+            }
+            const items = Array.isArray(data.items) ? data.items : [];
+            if (!items.length) {
+                this.ui.seriesStatus.textContent = `${data.series}: all ${data.unchanged} book${data.unchanged === 1 ? '' : 's'} already clean.`;
+                return;
+            }
+            this.ui.seriesStatus.textContent = data.source === 'wikidata'
+                ? 'Review the changes, then apply.'
+                : 'Wikidata has no list for this series; changes come from the titles alone. Review carefully.';
+            this.renderSeriesCleanup(data);
+        } catch (err) {
+            this.ui.seriesStatus.textContent = `Error: ${err.message}`;
+            console.error(err);
+        } finally {
+            this.ui.seriesCleanup.disabled = false;
+        }
+    },
+
+    renderSeriesCleanup(data) {
+        const items = Array.isArray(data.items) ? data.items : [];
+        const missing = Array.isArray(data.missing) ? data.missing : [];
+        const labels = { title: 'Title', author: 'Author', series: 'Series', series_index: '#' };
+        this.cleanupItems = {};
+
+        const rows = items.map((item) => {
+            this.cleanupItems[item.book_id] = item;
+            const changes = Array.isArray(item.changes) ? item.changes : [];
+            const lines = changes.map((field) => {
+                const before = field === 'series_index'
+                    ? this.formatSeriesIndex(item.current[field])
+                    : item.current[field];
+                const after = field === 'series_index'
+                    ? this.formatSeriesIndex(item.proposed[field])
+                    : item.proposed[field];
+                return `
+                    <div class="cleanup-change">
+                        <span class="cleanup-field">${labels[field] || field}</span>
+                        <span class="cleanup-old">${this.escapeHTML(before || '(none)')}</span>
+                        <span class="cleanup-new">${this.escapeHTML(after)}</span>
+                    </div>`;
+            }).join('');
+            const notes = [];
+            if (!item.verified) {
+                notes.push('not on Wikidata: from title only');
+            }
+            if (item.locked) {
+                notes.push('locked: unchecked');
+            }
+            // Locked books were curated by hand, so they start unchecked.
+            return `
+                <div class="cleanup-row">
+                    <input type="checkbox" data-cleanup-book="${item.book_id}" ${item.locked ? '' : 'checked'} aria-label="Apply to book ${item.book_id}">
+                    <span class="series-row-index">${this.escapeHTML(this.formatSeriesIndex(item.proposed.series_index))}</span>
+                    <div>
+                        <div class="cleanup-book">#${item.book_id} ${this.escapeHTML(item.proposed.title)}${notes.length ? ` <em>(${notes.join('; ')})</em>` : ''}</div>
+                        ${lines}
+                    </div>
+                </div>`;
+        }).join('');
+
+        const missingNote = missing.length
+            ? `<div class="series-row-local">Not in library: ${missing.map((m) => this.escapeHTML(`${this.formatSeriesIndex(m.index) ? '#' + this.formatSeriesIndex(m.index) + ' ' : ''}${m.title}`)).join(', ')}</div>`
+            : '';
+
+        this.ui.seriesResults.innerHTML = `
+            <div class="series-block">
+                <div class="series-block-head">
+                    <strong>${this.escapeHTML(data.series)}</strong>
+                    <span class="edit-status">${items.length} to fix, ${data.unchanged} already clean${data.source === 'wikidata' ? ', checked against Wikidata' : ''}</span>
+                </div>
+                <div class="series-rows">${rows}</div>
+                ${missingNote}
+                <div class="modal-actions">
+                    <button type="button" data-cleanup-apply="1">Write Changes to Checked EPUBs</button>
+                    <div class="edit-status" data-cleanup-apply-status></div>
+                </div>
+            </div>`;
+    },
+
+    async applySeriesCleanup(block) {
+        if (!block) {
+            return;
+        }
+        const status = block.querySelector('[data-cleanup-apply-status]');
+        const button = block.querySelector('[data-cleanup-apply]');
+        const items = [];
+        block.querySelectorAll('[data-cleanup-book]:checked').forEach((box) => {
+            const item = (this.cleanupItems || {})[box.dataset.cleanupBook];
+            if (!item) {
+                return;
+            }
+            // Send only the changed fields: the server leaves empty ones alone.
+            const out = { book_id: item.book_id };
+            (item.changes || []).forEach((field) => {
+                if (field === 'author') {
+                    out.authors = item.proposed.authors || [item.proposed.author];
+                } else {
+                    out[field] = item.proposed[field];
+                }
+            });
+            items.push(out);
+        });
+        if (!items.length) {
+            status.textContent = 'No books are checked.';
+            return;
+        }
+
+        button.disabled = true;
+        status.textContent = `Writing ${items.length} EPUB${items.length === 1 ? '' : 's'}...`;
+        try {
+            const response = await fetch('/api/admin/series/cleanup/apply', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ items })
+            });
+            if (!response.ok) {
+                if (response.status === 401) {
+                    await this.syncAuthStatus();
+                }
+                const msg = await response.text();
+                throw new Error(msg || `Series cleanup failed (${response.status})`);
+            }
+            const data = await response.json();
+            const results = Array.isArray(data.results) ? data.results : [];
+            const done = {};
+            results.filter((r) => r.ok).forEach((r) => { done[r.book_id] = r.book; });
+            const failed = results.filter((r) => !r.ok);
+
+            const patch = (b) => (done[b.id] ? { ...b, ...done[b.id] } : b);
+            this.allBooks = this.allBooks.map(patch);
+            this.filteredBooks = this.filteredBooks.map(patch);
+
+            // Keep the open editor in step, or a later "Save All Fields"
+            // would write the old values back.
+            const mine = this.modalBookId && done[this.modalBookId];
+            if (mine) {
+                ['title', 'author', 'series', 'series_index'].forEach((field) => {
+                    this.ui.fieldInputs[field].value = mine[field] || '';
+                });
+            }
+            block.querySelectorAll('[data-cleanup-book]').forEach((box) => {
+                if (done[box.dataset.cleanupBook]) {
+                    box.checked = false;
+                    box.disabled = true;
+                }
+            });
             this.applyFiltersAndRender();
 
             status.textContent = failed.length
@@ -2045,9 +2242,10 @@ const App = {
             return;
         }
         const mode = status.dry_run ? 'preview' : 'filling';
+        const notice = status.notice ? ` | ${status.notice}` : '';
         if (status.running) {
             this.ui.reviewEnrichStatus.textContent =
-                `${mode}: ${status.processed}/${status.total} | applied ${status.applied} | review ${status.queued_for_review}`;
+                `${mode}: ${status.processed}/${status.total} | applied ${status.applied} | review ${status.queued_for_review}${notice}`;
             return;
         }
         this.stopEnrichPolling();
@@ -2058,7 +2256,7 @@ const App = {
         if (status.phase === 'complete') {
             const verb = status.dry_run ? 'could fill' : 'filled';
             this.ui.reviewEnrichStatus.textContent =
-                `${mode} complete: ${verb} ${status.applied}, ${status.queued_for_review} queued, ${status.no_match} no match`;
+                `${mode} complete: ${verb} ${status.applied}, ${status.queued_for_review} queued, ${status.no_match} no match${notice}`;
             this.loadQualitySummary();
             this.loadReviewQueue();
         }

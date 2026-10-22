@@ -238,9 +238,11 @@ func parseSeriesIndex(raw string) (float64, bool) {
 }
 
 // titleVariants returns the title plus shorter forms with a subtitle or
-// trailing annotation removed, most specific first.
+// trailing annotation removed, most specific first. A series annotation such
+// as "Xanth 03 - " is not part of the book's name, so it is removed before
+// anything else.
 func titleVariants(title string) []string {
-	title = strings.TrimSpace(title)
+	title = normalize.Title(title, "", "").Title
 	out := []string{}
 	add := func(v string) {
 		v = strings.TrimSpace(v)

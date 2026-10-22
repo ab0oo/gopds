@@ -1004,6 +1004,41 @@ button {
     cursor: not-allowed;
 }
 
+.cleanup-row {
+    display: grid;
+    grid-template-columns: 22px 40px minmax(0, 1fr);
+    align-items: start;
+    gap: 8px;
+    padding: 5px 0;
+    font-size: 0.85rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.cleanup-book em {
+    color: var(--text-muted);
+}
+
+.cleanup-change {
+    display: grid;
+    grid-template-columns: 52px minmax(0, 1fr) minmax(0, 1fr);
+    gap: 8px;
+    font-size: 0.8rem;
+}
+
+.cleanup-field {
+    color: var(--text-muted);
+}
+
+.cleanup-old {
+    color: var(--text-muted);
+    text-decoration: line-through;
+}
+
+.cleanup-new {
+    color: var(--accent);
+}
+
+.series-block button[data-cleanup-apply],
 .series-block button[data-series-apply] {
     border-color: rgba(91, 192, 190, 0.4);
     background: rgba(91, 192, 190, 0.14);

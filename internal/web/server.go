@@ -114,6 +114,7 @@ type metadataSearchPayload struct {
 	NumFound int                 `json:"num_found"`
 	Query    string              `json:"query"`
 	Results  []metadataCandidate `json:"results"`
+	Notice   string              `json:"notice,omitempty"`
 }
 
 type coverCandidate struct {
@@ -272,6 +273,8 @@ func (s *Server) Router() http.Handler {
 	r.Put("/api/books/{id}/cover", s.requireAuth(s.HandleUpdateCover))
 	r.Get("/api/books/{id}/series/lookup", s.requireAuth(s.HandleSeriesLookup))
 	r.Post("/api/admin/series/apply", s.requireAuth(s.HandleSeriesApply))
+	r.Get("/api/books/{id}/series/cleanup", s.requireAuth(s.HandleSeriesCleanup))
+	r.Post("/api/admin/series/cleanup/apply", s.requireAuth(s.HandleSeriesCleanupApply))
 	r.Post("/api/admin/rebuild", s.requireAuth(s.HandleRebuildLibrary))
 	r.Post("/api/admin/rescan", s.requireAuth(s.HandleRescanLibrary))
 	r.Get("/api/admin/rebuild/status", s.requireAuth(s.HandleRebuildStatus))
@@ -1003,7 +1006,7 @@ func (s *Server) HandleOpenLibrarySearch(w http.ResponseWriter, r *http.Request)
 		gbByISBN, err := s.fetchGoogleBooks(client, "isbn:"+isbn, 4, "googlebooks:isbn")
 		if err == nil {
 			results = append(results, gbByISBN...)
-		} else {
+		} else if !errors.Is(err, errGoogleBooksPaused) {
 			log.Printf("google books isbn lookup failed (%s): %v", isbn, err)
 		}
 	}
@@ -1019,7 +1022,7 @@ func (s *Server) HandleOpenLibrarySearch(w http.ResponseWriter, r *http.Request)
 		gbSearch, err := s.fetchGoogleBooks(client, q, 6, "googlebooks:search")
 		if err == nil {
 			results = append(results, gbSearch...)
-		} else {
+		} else if !errors.Is(err, errGoogleBooksPaused) {
 			log.Printf("google books search failed (%s): %v", q, err)
 		}
 	}
@@ -1034,6 +1037,7 @@ func (s *Server) HandleOpenLibrarySearch(w http.ResponseWriter, r *http.Request)
 		NumFound: len(results),
 		Query:    q,
 		Results:  results,
+		Notice:   googleBooks.Notice(),
 	})
 }
 
@@ -1157,10 +1161,8 @@ func (s *Server) fetchGoogleBooks(client *http.Client, query string, maxResults 
 	if maxResults <= 0 {
 		maxResults = 6
 	}
-	googleURL := "https://www.googleapis.com/books/v1/volumes?maxResults=" + strconv.Itoa(maxResults) + "&q=" + url.QueryEscape(query)
-
 	var decoded googleBooksResponse
-	if err := fetchJSON(client, googleURL, &decoded); err != nil {
+	if err := fetchGoogleBooksVolumes(client, query, maxResults, &decoded); err != nil {
 		return nil, err
 	}
 
@@ -1209,12 +1211,37 @@ func (s *Server) fetchGoogleBooks(client *http.Client, query string, maxResults 
 	return results, nil
 }
 
+// upstreamError is a non-2xx response from an upstream metadata service.
+type upstreamError struct {
+	Status     int
+	Body       string
+	RetryAfter time.Duration
+}
+
+func (e *upstreamError) Error() string {
+	msg := e.Body
+	if len(msg) > 512 {
+		msg = msg[:512]
+	}
+	if msg == "" {
+		msg = "upstream returned an error"
+	}
+	return fmt.Sprintf("%s (%d)", msg, e.Status)
+}
+
 func fetchJSON(client *http.Client, endpoint string, target interface{}) error {
+	return fetchJSONWithHeaders(client, endpoint, nil, target)
+}
+
+func fetchJSONWithHeaders(client *http.Client, endpoint string, headers map[string]string, target interface{}) error {
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return err
 	}
 	applyOutboundHeaders(req)
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1223,12 +1250,12 @@ func fetchJSON(client *http.Client, endpoint string, target interface{}) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		msg := strings.TrimSpace(string(body))
-		if msg == "" {
-			msg = "upstream returned an error"
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		upstream := &upstreamError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
+		if secs, convErr := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); convErr == nil && secs > 0 {
+			upstream.RetryAfter = time.Duration(secs) * time.Second
 		}
-		return fmt.Errorf("%s (%d)", msg, resp.StatusCode)
+		return upstream
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
@@ -2137,9 +2164,11 @@ func fetchGoogleBookCoverCandidates(client *http.Client, query string, isbn stri
 	seen := map[string]struct{}{}
 
 	for _, q := range queries {
-		googleURL := "https://www.googleapis.com/books/v1/volumes?maxResults=" + strconv.Itoa(limit) + "&q=" + url.QueryEscape(q)
 		var decoded googleBooksResponse
-		if err := fetchJSON(client, googleURL, &decoded); err != nil {
+		if err := fetchGoogleBooksVolumes(client, q, limit, &decoded); err != nil {
+			if errors.Is(err, errGoogleBooksPaused) {
+				break
+			}
 			continue
 		}
 
@@ -2436,8 +2465,10 @@ func (s *Server) runScanJob(operation string) {
 	}
 
 	if operation == "rebuild" {
-		s.setRebuildProgress("resetting_db", "Resetting database cache...")
-		if err := s.db.RebuildBooksTable(); err != nil {
+		// Rows are re-read in place rather than dropped: review state, locks
+		// and download links all hang off the book id.
+		s.setRebuildProgress("resetting_db", "Marking every book for a full re-read...")
+		if err := s.db.MarkAllForRescan(); err != nil {
 			s.finishRebuildWithError(fmt.Sprintf("Failed to reset database: %v", err), label)
 			return
 		}
@@ -2463,6 +2494,17 @@ func (s *Server) runScanJob(operation string) {
 	if err := sc.Start(bookPath); err != nil {
 		s.finishRebuildWithError(fmt.Sprintf("%s scan failed: %v", label, err), label)
 		return
+	}
+	if operation == "rebuild" {
+		s.setRebuildProgress("pruning", "Removing books whose files are gone...")
+		removed, err := s.db.PruneMissingBooks(sc.SeenPaths())
+		if err != nil {
+			s.finishRebuildWithError(fmt.Sprintf("%s scan finished but pruning failed: %v", label, err), label)
+			return
+		}
+		if removed > 0 {
+			log.Printf("[rebuild] removed %d books whose files are gone", removed)
+		}
 	}
 
 	books, err := s.db.GetAllBooks()

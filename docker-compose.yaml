@@ -3,7 +3,7 @@ services:
     build: .
     image: ghcr.io/ab0oo/gopds:latest
     container_name: gopds
-    user: "998:998" # Use your actual host UID:GID, this needs to be the owner of the book library for writes
+    user: "33:33" # Use your actual host UID:GID, this needs to be the owner of the book library for writes
     ports:
       - "8880:8880"
     environment:
@@ -11,8 +11,11 @@ services:
       - DB_PATH=/app/data/gopds.db
       - CATEGORY_SOURCE=subject
       - ADMIN_USERNAME=admin
-      - ADMIN_PASSWORD=battery-correct-pony-stapler
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - GOOGLE_BOOKS_API_KEY=${GOOGLE_BOOKS_API_KEY}
     volumes:
-      - /share/Multimedia/books:/app/books       # Read-write if you want to use the GUI for metadata changes
-      - /share/Multimedia/config/gopds:/app/data # Read-write for DB and covers
+       - /var/www/books:/app/books
+       - /var/lib/gopds:/app/data
+#      - /share/Multimedia/books:/app/books       # Read-write if you want to use the GUI for metadata changes
+#      - /share/Multimedia/config/gopds:/app/data # Read-write for DB and covers
     restart: unless-stopped

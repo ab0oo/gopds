@@ -23,16 +23,29 @@ It builds to a single static binary (pure-Go SQLite, no CGO) and ships as a ~21M
   - Open Library + Google Books compare/apply workflow
   - Series tagging: look one book up on Wikidata, then write the series name and
     each volume's index to every matching book in the library after review
+  - Series cleanup: from one book, fix every book of its series at once --
+    titles lose `Xanth 03 - ` style prefixes and take Wikidata's spelling,
+    authors are checked against Wikidata, and series name and number are written
+    into each EPUB. Changes are previewed per book and written only for the books
+    you check; co-authors and other contributors are left alone
   - Cover candidate selection and apply, from inside the EPUB or from online sources
   - Optional write selected cover into EPUB (`write_to_epub`)
   - Rebuild/rescan controls
 - Cover behavior:
-  - Cache cover writes to `{data dir}/covers/{id}.jpg`
+  - Cache cover writes to `data/covers/{id}.jpg` under the working directory
+    (`/app/data/covers` in the container), regardless of `DB_PATH`
   - When writing to EPUB, also writes sibling `cover.jpg` next to the EPUB file
   - EPUB cover normalization prefers canonical `cover.jpg`
 - Scanner modes:
   - Incremental rescan (changed/new books only, based on file mod time)
-  - Full rebuild (drop DB cache + clear cover cache + full reindex)
+  - Full rebuild (re-read every book + clear cover cache + remove books whose files
+    are gone). Book IDs are kept, so review decisions, locks and download links
+    survive. A rebuild whose scan finds no books at all removes nothing, so an
+    unmounted library cannot wipe the index
+  - Each book also records its path relative to `BOOK_PATH`. If the library is
+    mounted somewhere else, or `BOOK_PATH` changes, books are matched back to their
+    existing entries by that relative path and keep their IDs. Files moved to a
+    different folder *within* the library are treated as new books
 
 ## Configuration
 
@@ -48,6 +61,7 @@ All configuration is via environment variables.
 | `ONLINE_COVER_MIN_WIDTH` | `300` | Online cover candidates narrower than this are discarded. Wikipedia covers use a floor of 200, since fair-use images there are small. |
 | `ONLINE_COVER_MIN_HEIGHT` | `420` | Online cover candidates shorter than this are discarded. Wikipedia covers use a floor of 300. |
 | `ENRICH_RATE_MS` | `1000` | Milliseconds between upstream lookups during background enrichment. |
+| `GOOGLE_BOOKS_API_KEY` | *(none)* | Optional Google Books API key. Without one, lookups share Google's small anonymous quota. |
 | `LISTEN_ADDR` | `:8880` | Address the HTTP server binds to. |
 
 The server listens on port `8880` by default (see `LISTEN_ADDR`).
@@ -85,6 +99,7 @@ services:
       - CATEGORY_SOURCE=subject
       - ADMIN_USERNAME=admin
       - ADMIN_PASSWORD=${GOPDS_ADMIN_PASSWORD:?set this in a .env file}
+      - GOOGLE_BOOKS_API_KEY=${GOOGLE_BOOKS_API_KEY:-} # optional
     volumes:
       - /path/to/books:/app/books
       - /path/to/gopds-data:/app/data
@@ -97,9 +112,10 @@ Important:
   `tmpfs` (e.g. under `/var/run`), or the index and cover cache are lost on every reboot.
   A missing-but-creatable directory is fine; an unwritable one fails at startup with
   `unable to open database file`.
+- Mount the data volume at `/app/data`. The cover cache always lives in `data/covers`
+  under the working directory (`/app`), even if `DB_PATH` points elsewhere.
 - If you want EPUB metadata/cover writes, the books volume must be writable too.
 - If `ADMIN_PASSWORD` is empty, admin-protected editing features are unavailable.
-- Keep real passwords out of committed compose files; use a `.env` file or secrets.
 
 ## OPDS Endpoints
 
@@ -115,6 +131,9 @@ Important:
 - `GET /opds/categories?category=Fiction`
 - `GET /opds/categories?category=Fiction&subcategory=SciFi&page=1&limit=100`
   - Category/subcategory navigation + acquisition feeds.
+- `GET /opds/series`
+- `GET /opds/series?series=Xanth&page=1&limit=100`
+  - Series navigation feed, and each series' books in series order.
 
 `GET /` serves the OPDS catalog to OPDS clients and the HTML UI to browsers, based on the
 `Accept` header. Append `?opds=1` to force the catalog.
@@ -126,6 +145,7 @@ Public:
 - `GET /opds`
 - `GET /opds/authors`
 - `GET /opds/categories`
+- `GET /opds/series`
 - `GET /api/books`
 - `GET /covers/{id}.jpg`
 - `GET /download/{id}`
@@ -147,6 +167,8 @@ Admin-protected:
 - `PUT /api/books/{id}/cover`
 - `GET /api/books/{id}/series/lookup`
 - `POST /api/admin/series/apply`
+- `GET /api/books/{id}/series/cleanup`
+- `POST /api/admin/series/cleanup/apply`
 - `POST /api/admin/rescan`
 - `POST /api/admin/rebuild`
 - `GET /api/admin/rebuild/status`
@@ -157,6 +179,10 @@ Admin-protected:
 - `POST /api/admin/enrich/stop`
 - `GET /api/admin/enrich/status`
 - `GET /api/admin/enrich/proposals`
+- `GET /api/admin/review`
+- `POST /api/admin/review/{id}/resolve`
+- `PUT /api/admin/review/{id}/lock`
+- `POST /api/admin/review/{id}/rescore`
 
 Sessions are held in memory with a 12-hour TTL and delivered as an `HttpOnly` cookie.
 They do not survive a server restart.
@@ -165,15 +191,17 @@ They do not survive a server restart.
 
 Every scan scores each book 0-100 on metadata completeness (description, cover
 size, author form, category, identifier, series) and records the result in a
-`book_enrichment` table kept separate from `books`, so a full rebuild never
-discards human decisions.
+`book_enrichment` table kept separate from `books` and keyed by book ID, which
+stays stable across rescans, rebuilds and library moves.
 
 Two cleanup layers build on that score:
 
 **Deterministic normalization** runs on every scan with no network access. It
 canonicalizes `Last, First` author names to `First Last`, repairs ALL-CAPS
-names, and lifts trailing `(Series Name Book 3)` annotations out of titles into
-proper series fields. Anything it cannot decide with certainty -- multi-author
+names, and lifts series annotations out of titles into proper series fields,
+both trailing (`Castle Roogna (Xanth #3)`) and leading (`Xanth 03 - Castle
+Roogna`). When an EPUB lists several creators, the first author is used, not
+illustrators or translators. Anything it cannot decide with certainty -- multi-author
 strings, `writing as` pseudonyms, series text embedded in the author field -- is
 flagged for review rather than rewritten on a guess.
 
@@ -188,7 +216,11 @@ Library and Google Books. It is deliberately conservative:
   strong title *and* author agreement. Weaker matches are queued for review.
 - **Database only.** The automated pass does not modify EPUB files.
 - **Locked books are skipped**, so manual edits are never clobbered.
-- Rate-limited to one upstream request per second (`ENRICH_RATE_MS` to adjust).
+- Rate-limited to one book per second (`ENRICH_RATE_MS` to adjust).
+- **Backs off when Google Books runs out of quota.** After a quota response,
+  Google Books is skipped until the quota resets (midnight Pacific for the daily
+  limit) and lookups continue with Open Library alone. The search and enrichment
+  status responses carry a `notice` while this is in effect.
 
 **Cover selection** picks the best artwork an EPUB actually contains, judged on
 shape and resolution rather than filename order. Book covers are portrait and
@@ -211,19 +243,25 @@ Lock actions, plus the enrichment and cover-upgrade controls.
 ## UI Notes
 
 - Browser UI is at `/`.
+- `Group series` collapses each multi-book series into one stacked card; click it to
+  expand the volumes.
 - Admin login is required to see and use:
-  - `Edit Metadata`
+  - `Edit Metadata`, which also holds the series tools: `Find Series Books` (tag a
+    series from Wikidata) and `Clean Up Series` (fix titles, authors and numbering
+    for a whole series)
   - `Change Cover`
+  - `Metadata Review` (quality queue, enrichment and cover upgrade)
   - `Rescan/Rebuild` controls
 - OPDS clients can use `/opds` (or root with OPDS accept headers).
 
 ## Build and Run Locally
 
 ```bash
-go mod tidy
 go build -o gopds ./cmd/gopds
 ./gopds
 ```
+
+Run the checks CI runs with `go vet ./... && go test ./...`.
 
 Then open:
 
@@ -248,11 +286,13 @@ before rescanning.
 GitHub Actions workflow:
 
 - `.github/workflows/docker-build.yml`
-- Builds the Docker image on push to `main`, tags, releases, PRs, and manual dispatch
-- Publishes to GHCR on `v*` tags and published releases:
-  - `ghcr.io/<owner>/<repo>:latest` (default branch)
-  - ref/tag/sha tags
-- Uploads a compressed Docker image tarball artifact for each run
+- Runs on push to `main`, `v*` tags, published releases, PRs, and manual dispatch
+- Runs `go vet ./...` and `go test ./...` first; the image is only built if both pass
+- Publishes to GHCR only for `v*` tags and published releases, tagged:
+  - `latest`
+  - the tag name
+  - the commit SHA
+- Uploads a compressed Docker image tarball artifact for every run (kept 14 days)
 
 ## Security Recommendations
 

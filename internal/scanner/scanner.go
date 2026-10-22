@@ -33,8 +33,11 @@ type Container struct {
 }
 
 type OPF struct {
-	Title       string   `xml:"metadata>title"`
-	Creator     string   `xml:"metadata>creator"`
+	Title    string   `xml:"metadata>title"`
+	Creators []string `xml:"metadata>creator"`
+	// Creator is the primary author, set by ExtractMetadata. Decoding
+	// repeated creators into one string kept the last, often a co-author.
+	Creator     string   `xml:"-"`
 	Description string   `xml:"metadata>description"`
 	Subjects    []string `xml:"metadata>subject"`
 	Identifiers []string `xml:"metadata>identifier"`
@@ -125,6 +128,12 @@ func ExtractMetadata(path string) (*OPF, error) {
 			if err := xml.Unmarshal(opfContent, &opf); err != nil {
 				return nil, err
 			}
+			if metaBlock, err := extractMetadataBlock(opfContent); err == nil {
+				opf.Creator = primaryAuthor(metaBlock)
+			}
+			if opf.Creator == "" && len(opf.Creators) > 0 {
+				opf.Creator = strings.TrimSpace(opf.Creators[0])
+			}
 			if len(opf.Subjects) == 0 {
 				if metaBlock, err := extractMetadataBlock(opfContent); err == nil {
 					opf.Subjects = extractAllTagValues(metaBlock, "subject")
@@ -155,7 +164,7 @@ func ExtractLiveMetadata(epubPath string) (*EPUBMetadata, error) {
 
 	return &EPUBMetadata{
 		Title:       extractFirstTagValue(metaBlock, "title"),
-		Author:      extractFirstTagValue(metaBlock, "creator"),
+		Author:      primaryAuthor(metaBlock),
 		Language:    extractFirstTagValue(metaBlock, "language"),
 		Identifier:  identifier,
 		Publisher:   extractFirstTagValue(metaBlock, "publisher"),
@@ -625,10 +634,18 @@ func xmlEscape(s string) (string, error) {
 
 type Scanner struct {
 	db *database.DB
+	// seen holds every EPUB path the last Start walked, changed or not, so
+	// a full rebuild can tell which rows no longer have a file.
+	seen map[string]struct{}
 }
 
 func New(db *database.DB) *Scanner {
 	return &Scanner{db: db}
+}
+
+// SeenPaths returns the EPUB paths found by the last Start.
+func (s *Scanner) SeenPaths() map[string]struct{} {
+	return s.seen
 }
 
 func (s *Scanner) Start(root string) error {
@@ -650,6 +667,7 @@ func (s *Scanner) Start(root string) error {
 		Normalized int
 		Flagged    int
 		QualitySum int
+		Relinked   int
 	}{}
 
 	tx, err := s.db.Begin()
@@ -658,16 +676,30 @@ func (s *Scanner) Start(root string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	if err := s.db.BackfillRelPathsTx(tx, realPath); err != nil {
+		return err
+	}
+	s.seen = map[string]struct{}{}
+
 	err = filepath.WalkDir(realPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(strings.ToLower(d.Name()), ".epub") {
 			return nil
 		}
 
 		stats.Total++
+		s.seen[path] = struct{}{}
 		info, _ := d.Info()
+		relPath, _ := database.RelativeLibraryPath(realPath, path)
 
 		if !s.db.NeedsReScan(path, info.ModTime()) {
 			return nil
+		}
+		// A path we have never seen may be a known book whose library is now
+		// mounted elsewhere; reclaim its row rather than starting a new one.
+		if moved, err := s.db.RelinkMovedBookTx(tx, relPath, path); err != nil {
+			log.Printf("❌ Error relinking %s: %v", path, err)
+		} else if moved {
+			stats.Relinked++
 		}
 		stats.Rescanned++
 
@@ -702,6 +734,7 @@ func (s *Scanner) Start(root string) error {
 			Series:      titleRes.Series,
 			SeriesIndex: titleRes.SeriesIndex,
 			ModTime:     info.ModTime(),
+			RelPath:     relPath,
 		}
 		switch categorySource {
 		case "path":
@@ -757,6 +790,9 @@ func (s *Scanner) Start(root string) error {
 	log.Printf("\n--- 🏁 Scan Complete (%v) ---", elapsed)
 	log.Printf("Total Books Found:  %d", stats.Total)
 	log.Printf("New/Updated:       %d", stats.Rescanned)
+	if stats.Relinked > 0 {
+		log.Printf("Moved (relinked):   %d", stats.Relinked)
+	}
 	log.Printf("Missing Metadata:   %d (Used filename instead)", stats.NoMeta)
 	log.Printf("Missing Covers:     %d", stats.NoCover)
 	log.Printf("Normalized:         %d", stats.Normalized)

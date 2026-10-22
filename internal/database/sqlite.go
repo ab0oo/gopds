@@ -25,6 +25,10 @@ type Book struct {
 	Series      string    `json:"series"`
 	SeriesIndex string    `json:"series_index"`
 	ModTime     time.Time `json:"mod_time"`
+	// RelPath is the file's path relative to the library root, slash
+	// separated. Unlike Path it survives the library being mounted somewhere
+	// else, so it is what ties a moved file back to its existing row.
+	RelPath string `json:"-"`
 }
 
 type DB struct {
@@ -42,12 +46,13 @@ CREATE TABLE IF NOT EXISTS books (
 	subcategory TEXT,
 	series TEXT,
 	series_index TEXT,
-	mod_time DATETIME
+	mod_time DATETIME,
+	rel_path TEXT
 );`
 
 // book_enrichment records what we know *about* each book's metadata quality,
-// separate from the metadata itself. Keeping it in its own table means a full
-// rebuild can drop and re-derive `books` without losing human decisions.
+// separate from the metadata itself. It is keyed by book id, so book ids must
+// stay stable: a rebuild re-reads rows in place rather than dropping them.
 const enrichmentTableDDL = `
 CREATE TABLE IF NOT EXISTS book_enrichment (
 	book_id       INTEGER PRIMARY KEY,
@@ -72,9 +77,10 @@ const saveEnrichmentSQL = `
 // LastInsertId() reports the most recent *insert* rowid, not this row's id,
 // which previously caused covers to be filed under the wrong book on rescan.
 const saveBookSQL = `
-	INSERT INTO books (path, title, author, description, category, subcategory, series, series_index, mod_time)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	INSERT INTO books (path, title, author, description, category, subcategory, series, series_index, mod_time, rel_path)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, nullif(?, ''))
 	ON CONFLICT(path) DO UPDATE SET
+		rel_path=coalesce(excluded.rel_path, books.rel_path),
 		title=excluded.title,
 		author=excluded.author,
 		description=excluded.description,
@@ -139,7 +145,7 @@ func (db *DB) NeedsReScan(path string, currentModTime time.Time) bool {
 func (db *DB) SaveBook(b Book) (int64, error) {
 	var id int64
 	err := db.conn.QueryRow(saveBookSQL, b.Path, b.Title, b.Author, b.Description,
-		b.Category, b.Subcategory, b.Series, b.SeriesIndex, b.ModTime).Scan(&id)
+		b.Category, b.Subcategory, b.Series, b.SeriesIndex, b.ModTime, b.RelPath).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
@@ -153,7 +159,7 @@ func (db *DB) Begin() (*sql.Tx, error) {
 func (db *DB) SaveBookTx(tx *sql.Tx, b Book) (int64, error) {
 	var id int64
 	err := tx.QueryRow(saveBookSQL, b.Path, b.Title, b.Author, b.Description,
-		b.Category, b.Subcategory, b.Series, b.SeriesIndex, b.ModTime).Scan(&id)
+		b.Category, b.Subcategory, b.Series, b.SeriesIndex, b.ModTime, b.RelPath).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
@@ -189,14 +195,145 @@ func (db *DB) UpdateBookPath(id int, path string) error {
 	return err
 }
 
-func (db *DB) RebuildBooksTable() error {
-	if _, err := db.conn.Exec("DROP TABLE IF EXISTS books"); err != nil {
+// RelinkMovedBookTx points an existing row at newPath when the library has
+// been mounted somewhere else: a row with the same relative path whose old
+// file no longer exists is the same book. Keeping the row keeps its id, and
+// with it the review state, locks, cached cover and download links. It
+// reports whether a row was relinked.
+func (db *DB) RelinkMovedBookTx(tx *sql.Tx, relPath, newPath string) (bool, error) {
+	if relPath == "" {
+		return false, nil
+	}
+	var exists int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM books WHERE path = ?`, newPath).Scan(&exists); err != nil || exists > 0 {
+		return false, err
+	}
+	rows, err := tx.Query(`SELECT id, path FROM books WHERE rel_path = ? ORDER BY id`, relPath)
+	if err != nil {
+		return false, err
+	}
+	type candidate struct {
+		id   int
+		path string
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.path); err != nil {
+			rows.Close()
+			return false, err
+		}
+		candidates = append(candidates, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	for _, c := range candidates {
+		// A file still present at the old path is a different copy, not a move.
+		if _, err := os.Stat(c.path); err == nil {
+			continue
+		}
+		if _, err := tx.Exec(`UPDATE books SET path = ? WHERE id = ?`, newPath, c.id); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// BackfillRelPathsTx records relative paths for rows saved before rel_path
+// existed, so they can be relinked if the library later moves.
+func (db *DB) BackfillRelPathsTx(tx *sql.Tx, root string) error {
+	rows, err := tx.Query(`SELECT id, path FROM books WHERE rel_path IS NULL OR rel_path = ''`)
+	if err != nil {
 		return err
 	}
-	if _, err := db.conn.Exec(booksTableDDL); err != nil {
+	updates := map[int]string{}
+	for rows.Next() {
+		var id int
+		var path string
+		if err := rows.Scan(&id, &path); err != nil {
+			rows.Close()
+			return err
+		}
+		if rel, ok := RelativeLibraryPath(root, path); ok {
+			updates[id] = rel
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
 		return err
+	}
+	for id, rel := range updates {
+		if _, err := tx.Exec(`UPDATE books SET rel_path = ? WHERE id = ?`, rel, id); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// RelativeLibraryPath returns path relative to root in slash form, or false
+// when path is not inside root.
+func RelativeLibraryPath(root, path string) (string, bool) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return filepath.ToSlash(rel), true
+}
+
+// MarkAllForRescan makes the next scan re-read every file, as a rebuild
+// should, without dropping rows: book ids, and everything keyed by them,
+// stay put.
+func (db *DB) MarkAllForRescan() error {
+	_, err := db.conn.Exec(`UPDATE books SET mod_time = ?`, time.Time{})
+	return err
+}
+
+// PruneMissingBooks deletes books whose files were not seen by the last full
+// scan, along with their quality records. It refuses an empty keep set: a
+// scan that found nothing more likely means an unmounted library than an
+// empty one.
+func (db *DB) PruneMissingBooks(seen map[string]struct{}) (int, error) {
+	if len(seen) == 0 {
+		return 0, errors.New("scan found no books; refusing to prune the whole library")
+	}
+	rows, err := db.conn.Query(`SELECT id, path FROM books`)
+	if err != nil {
+		return 0, err
+	}
+	var gone []int
+	for rows.Next() {
+		var id int
+		var path string
+		if err := rows.Scan(&id, &path); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if _, ok := seen[path]; !ok {
+			gone = append(gone, id)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, id := range gone {
+		if _, err := tx.Exec(`DELETE FROM book_enrichment WHERE book_id = ?`, id); err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(`DELETE FROM books WHERE id = ?`, id); err != nil {
+			return 0, err
+		}
+	}
+	return len(gone), tx.Commit()
 }
 
 // GetAllBooks retrieves every book stored in the database.
@@ -270,6 +407,14 @@ func ensureBooksColumns(db *sql.DB) error {
 		if _, err := db.Exec("ALTER TABLE books ADD COLUMN series_index TEXT"); err != nil {
 			return err
 		}
+	}
+	if _, ok := existing["rel_path"]; !ok {
+		if _, err := db.Exec("ALTER TABLE books ADD COLUMN rel_path TEXT"); err != nil {
+			return err
+		}
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_books_rel_path ON books(rel_path)"); err != nil {
+		return err
 	}
 	return nil
 }
