@@ -415,6 +415,60 @@ func (db *DB) GetBooksByCategory(category, subcategory string, limit, offset int
 	return books, nil
 }
 
+func (db *DB) GetSeriesCounts() (map[string]int, error) {
+	rows, err := db.conn.Query(`SELECT trim(coalesce(series,'')) AS s, COUNT(*) FROM books WHERE trim(coalesce(series,'')) != '' GROUP BY s ORDER BY s COLLATE NOCASE`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]int{}
+	for rows.Next() {
+		var series string
+		var count int
+		if err := rows.Scan(&series, &count); err != nil {
+			return nil, err
+		}
+		out[series] = count
+	}
+	return out, nil
+}
+
+func (db *DB) CountBooksBySeries(series string) (int, error) {
+	series = strings.TrimSpace(series)
+	query := `SELECT COUNT(*) FROM books WHERE trim(coalesce(series,'')) = ?`
+
+	var count int
+	if err := db.conn.QueryRow(query, series).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (db *DB) GetBooksBySeries(series string, limit, offset int) ([]Book, error) {
+	series = strings.TrimSpace(series)
+
+	query := "SELECT id, path, title, author, description, category, subcategory, coalesce(series,''), coalesce(series_index,''), mod_time FROM books WHERE trim(coalesce(series,'')) = ?"
+	query += " ORDER BY CASE WHEN typeof(series_index) = 'text' AND series_index GLOB '[0-9]*' THEN CAST(series_index AS REAL) ELSE 999999 END, title COLLATE NOCASE LIMIT ? OFFSET ?"
+	args := []any{series, limit, offset}
+
+	rows, err := db.conn.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	books := make([]Book, 0, limit)
+	for rows.Next() {
+		var b Book
+		if err := rows.Scan(&b.ID, &b.Path, &b.Title, &b.Author, &b.Description, &b.Category, &b.Subcategory, &b.Series, &b.SeriesIndex, &b.ModTime); err != nil {
+			return nil, err
+		}
+		books = append(books, b)
+	}
+	return books, nil
+}
+
 // Enrichment is the quality/provenance record for one book.
 type Enrichment struct {
 	BookID      int       `json:"book_id"`

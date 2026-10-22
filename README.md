@@ -12,6 +12,7 @@ It builds to a single static binary (pure-Go SQLite, no CGO) and ships as a ~21M
 - OPDS catalog serving with large-library navigation:
   - Root OPDS navigation feed at `/opds`
   - Author-range browsing (`authors=a`, `authors=a-d`) with pagination
+  - Series browsing at `/opds/series`
   - Category/subcategory browsing at `/opds/categories`
 - Public book access:
   - OPDS feeds
