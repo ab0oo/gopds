@@ -18,6 +18,7 @@ import (
 
 	"github.com/ab0oo/gopds/internal/kindle"
 	"github.com/ab0oo/gopds/internal/mailer"
+	"github.com/ab0oo/gopds/internal/normalize"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -222,7 +223,7 @@ func (s *Server) HandleEmailBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filename := kindle.AttachmentName(book.Title, book.Author)
+	filename := normalize.ASCIIFilename(bookFilename(*book))
 	subject := strings.TrimSpace(book.Title)
 	if subject == "" {
 		subject = "Book from GoPDS"

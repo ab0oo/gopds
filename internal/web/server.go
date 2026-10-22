@@ -1894,7 +1894,7 @@ func (s *Server) HandleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.epub\"", book.Title))
+	w.Header().Set("Content-Disposition", contentDisposition(bookFilename(*book)))
 	w.Header().Set("Content-Type", "application/epub+zip")
 	http.ServeFile(w, r, bookPath)
 }
