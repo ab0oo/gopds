@@ -193,9 +193,8 @@ func Send(cfg Config, to string, msg []byte) error {
 	}
 	defer c.Close()
 
-	if hostname, err := os.Hostname(); err == nil && strings.Contains(hostname, ".") {
-		_ = c.Hello(hostname)
-	}
+	hostname, _ := os.Hostname()
+	_ = c.Hello(heloName(hostname, cfg.From))
 
 	_, encrypted := conn.(*tls.Conn)
 	if !encrypted {
@@ -233,6 +232,21 @@ func Send(cfg Config, to string, msg []byte) error {
 		return fmt.Errorf("server refused the message: %w", err)
 	}
 	return c.Quit()
+}
+
+// heloName is the name to greet the server with. Many servers reject a HELO
+// that is not fully qualified, and net/smtp's default is "localhost". In a
+// container the hostname is a bare ID, so the sender's domain stands in.
+func heloName(hostname, from string) string {
+	if strings.Contains(hostname, ".") && !strings.HasPrefix(hostname, "localhost") {
+		return hostname
+	}
+	if addr, err := mail.ParseAddress(from); err == nil {
+		if at := strings.LastIndex(addr.Address, "@"); at >= 0 && strings.Contains(addr.Address[at+1:], ".") {
+			return addr.Address[at+1:]
+		}
+	}
+	return "localhost"
 }
 
 func isLocalhost(host string) bool {
