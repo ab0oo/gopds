@@ -60,6 +60,25 @@ func TestMatchSeriesEntriesPlacesAnchorByTitle(t *testing.T) {
 	}
 }
 
+func TestMatchSeriesEntriesIgnoresSeriesPrefix(t *testing.T) {
+	// Titles cached before the scanner learned to strip "Xanth 03 - " still
+	// carry the prefix; they must match the bare Wikidata volume names.
+	entries := []seriesEntry{
+		{ID: "Q1", Title: "A Spell for Chameleon", Index: "1"},
+		{ID: "Q3", Title: "Castle Roogna", Index: "3"},
+		{ID: "Q4", Title: "Centaur Aisle", Index: "4"},
+	}
+	anchor := database.Book{ID: 1, Title: "A Spell for Chameleon", Author: "Piers Anthony"}
+	books := []database.Book{
+		anchor,
+		{ID: 3, Title: "Xanth 03 - Castle Roogna", Author: "Piers Anthony"},
+		{ID: 4, Title: "Xanth 04 - Centaur Aisle", Author: "Piers Anthony"},
+	}
+	if n := matchSeriesEntries(entries, books, anchor, "Q1"); n != 3 {
+		t.Fatalf("matched = %d, want 3", n)
+	}
+}
+
 func TestSameAuthor(t *testing.T) {
 	cases := []struct {
 		a, b string

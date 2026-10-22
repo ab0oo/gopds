@@ -22,9 +22,10 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-// enrichDefaultRateLimit is the pause between upstream lookups. Open Library
-// and Google Books are free services being used by a hobby project; one request
-// per second is deliberately gentle and keeps us far from any rate limit.
+// enrichDefaultRateLimit is the pause between books. Open Library and Google
+// Books are free services being used by a hobby project, so one book per second
+// is deliberately gentle. Each book costs up to two Google Books queries, which
+// count against a daily quota that pacing cannot protect; see googleBooksGate.
 const enrichDefaultRateLimit = time.Second
 
 // enrichStatus is the observable state of a background enrichment run.
@@ -39,6 +40,7 @@ type enrichStatus struct {
 	Queued      int       `json:"queued_for_review"`
 	NoMatch     int       `json:"no_match"`
 	Errors      int       `json:"errors"`
+	Notice      string    `json:"notice,omitempty"`
 	StartedAt   time.Time `json:"started_at,omitempty"`
 	CompletedAt time.Time `json:"completed_at,omitempty"`
 	Error       string    `json:"error,omitempty"`
@@ -119,6 +121,9 @@ func (s *Server) HandleEnrichStatus(w http.ResponseWriter, r *http.Request) {
 	e.mu.Lock()
 	status := e.status
 	e.mu.Unlock()
+	if status.Notice == "" {
+		status.Notice = googleBooks.Notice()
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
@@ -192,8 +197,13 @@ func (s *Server) runEnrichment(limit int, apply bool, cancel chan struct{}) {
 
 		s.enrichOneBook(client, book, apply)
 
+		// Kept on the status so a finished run still says it lacked Google Books.
+		notice := googleBooks.Notice()
 		e.mu.Lock()
 		e.status.Processed++
+		if notice != "" {
+			e.status.Notice = notice
+		}
 		e.mu.Unlock()
 	}
 

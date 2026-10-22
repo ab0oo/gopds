@@ -95,6 +95,43 @@ func TestTitleSeriesExtraction(t *testing.T) {
 	}
 }
 
+func TestTitleSeriesPrefixExtraction(t *testing.T) {
+	cases := []struct{ in, wantTitle, wantSeries, wantIdx string }{
+		{"Xanth 03 - Castle Roogna", "Castle Roogna", "Xanth", "3"},
+		{"Xanth 33 - Jumper Cable", "Jumper Cable", "Xanth", "33"},
+		{"Bio of a Space Tyrant 1 - Refugee", "Refugee", "Bio of a Space Tyrant", "1"},
+		{"Chronicles of Amber #01 - Nine Princes in Amber", "Nine Princes in Amber", "Chronicles of Amber", "1"},
+		{"Darktower 6 – Song of Susannah", "Song of Susannah", "Darktower", "6"},
+		{"Colter Shaw 3.5 - The Deadline Clock", "The Deadline Clock", "Colter Shaw", "3.5"},
+		{"[Acorna 08] - First Warning", "First Warning", "Acorna", "8"},
+		{"Evan Smoak 07 - Dark Horse - Der Außenseiter", "Dark Horse - Der Außenseiter", "Evan Smoak", "7"},
+		{"Agatha Christie - Hercule Poirot 07 - Peril at End House", "Peril at End House", "Hercule Poirot", "7"},
+		{"Book 15 - Clarissa Oakes", "Clarissa Oakes", "", "15"},
+		{"Volume 2 - The Restaurant At The End Of The Universe", "The Restaurant At The End Of The Universe", "", "2"},
+		// Left alone: colon separators, years, nested series, no number.
+		{"Liberty 1784: The Second War for Independence", "Liberty 1784: The Second War for Independence", "", ""},
+		{"The Primal Hunter 11: A LitRPG Adventure", "The Primal Hunter 11: A LitRPG Adventure", "", ""},
+		{"Dune 2000 - A Retrospective", "Dune 2000 - A Retrospective", "", ""},
+		{"Valdemar 01 - [Mage Wars 03] - The Silver Gryphon", "Valdemar 01 - [Mage Wars 03] - The Silver Gryphon", "", ""},
+		{"The Complete Vampire Project Series: (Books 1 - 5)", "The Complete Vampire Project Series: (Books 1 - 5)", "", ""},
+		{"Spider-Man - Forever Young", "Spider-Man - Forever Young", "", ""},
+	}
+	for _, c := range cases {
+		got := Title(c.in, "", "")
+		if got.Title != c.wantTitle || got.Series != c.wantSeries || got.SeriesIndex != c.wantIdx {
+			t.Errorf("Title(%q) = (%q, %q, %q), want (%q, %q, %q)",
+				c.in, got.Title, got.Series, got.SeriesIndex, c.wantTitle, c.wantSeries, c.wantIdx)
+		}
+	}
+}
+
+func TestTitleSeriesPrefixKeepsExistingSeries(t *testing.T) {
+	got := Title("Bond 10 - The Spy Who Loved Me", "James Bond (Original Series)", "10.0")
+	if got.Title != "The Spy Who Loved Me" || got.Series != "James Bond (Original Series)" || got.SeriesIndex != "10.0" {
+		t.Errorf("got (%q, %q, %q)", got.Title, got.Series, got.SeriesIndex)
+	}
+}
+
 func TestTitleNeverOverwritesExistingSeries(t *testing.T) {
 	got := Title("Imperial Lady (Central Asia Series Book 1)", "Real Series", "9")
 	if got.Series != "Real Series" || got.SeriesIndex != "9" {
@@ -106,7 +143,7 @@ func TestTitleNeverOverwritesExistingSeries(t *testing.T) {
 }
 
 func TestTitleIdempotent(t *testing.T) {
-	for _, in := range []string{"Imperial Lady (Central Asia Series Book 1)", "The Hit (Will Robie Book 2)"} {
+	for _, in := range []string{"Imperial Lady (Central Asia Series Book 1)", "The Hit (Will Robie Book 2)", "Xanth 03 - Castle Roogna"} {
 		first := Title(in, "", "")
 		second := Title(first.Title, first.Series, first.SeriesIndex)
 		if second.Title != first.Title || second.Series != first.Series {

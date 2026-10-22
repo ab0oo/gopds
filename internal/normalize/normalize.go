@@ -204,7 +204,19 @@ var (
 	// "(Book 3)", "(#2)" with no series name attached
 	seriesBareNumRe = regexp.MustCompile(`(?i)\s*[\(\[]\s*(?:#|book\s*|vol\.?\s*)\s*(\d+(?:\.\d+)?)\s*[\)\]]\s*$`)
 	hashLikeRe      = regexp.MustCompile(`^[0-9a-f]{16,}$`)
+	// "Xanth 03 - Castle Roogna", "Chronicles of Amber #01 - Nine Princes in
+	// Amber", "[Acorna 08] - First Warning". Only a dash separates: after a
+	// colon the number is too often part of the real title ("Liberty 1784: The
+	// Second War for Independence", "The Primal Hunter 11: A LitRPG Adventure").
+	// At most three digits, so a year is never taken for a series position.
+	seriesPrefixRe = regexp.MustCompile(`(?i)^\[?\s*([^\[\]]*?)[\s,]*(?:#|book\s*|vol(?:ume)?\.?\s*|part\s*)?(\d{1,3}(?:\.\d+)?)\s*\]?\s+[-–—]\s+(\S.*)$`)
+	// Prefix "series names" that only say which volume this is.
+	genericSeriesWords = map[string]bool{"book": true, "volume": true, "vol": true, "part": true}
 )
+
+// maxSeriesPrefixWords keeps a sentence-like title from being read as a
+// series name.
+const maxSeriesPrefixWords = 6
 
 // Title strips trailing series annotations from a title and returns them as
 // structured series fields. Existing series values take precedence: this only
@@ -240,6 +252,16 @@ func Title(raw, existingSeries, existingIndex string) TitleResult {
 		}
 	}
 
+	if name, idx, rest, ok := splitSeriesPrefix(res.Title); ok {
+		res.Title = rest
+		if res.Series == "" {
+			res.Series = sanitizeSeriesName(name)
+		}
+		if res.SeriesIndex == "" {
+			res.SeriesIndex = idx
+		}
+	}
+
 	res.Title = fixAllCaps(res.Title)
 
 	// A title that is a bare hash or that we emptied out is not usable.
@@ -254,6 +276,40 @@ func Title(raw, existingSeries, existingIndex string) TitleResult {
 		res.Series != strings.TrimSpace(existingSeries) ||
 		res.SeriesIndex != strings.TrimSpace(existingIndex)
 	return res
+}
+
+// splitSeriesPrefix splits "Xanth 03 - Castle Roogna" into its series name,
+// position and real title. name is empty when the prefix carries only a
+// position ("Book 15 - Clarissa Oakes").
+func splitSeriesPrefix(title string) (name, index, rest string, ok bool) {
+	m := seriesPrefixRe.FindStringSubmatch(title)
+	if m == nil {
+		return "", "", "", false
+	}
+	name, index, rest = collapseSpace(m[1]), m[2], strings.TrimSpace(m[3])
+	// "Agatha Christie - Hercule Poirot 07 - ..." leads with the author.
+	if i := strings.LastIndex(name, " - "); i >= 0 {
+		name = strings.TrimSpace(name[i+3:])
+	}
+	// Brackets or a colon mean the number sits inside a real title, as in
+	// "The Complete Vampire Project Series: (Books 1 - 5)".
+	if strings.ContainsAny(name, "():") || hasDigitRe.MatchString(name) ||
+		len(strings.Fields(name)) > maxSeriesPrefixWords {
+		return "", "", "", false
+	}
+	// "Valdemar 01 - [Mage Wars 03] - The Silver Gryphon" names two series;
+	// leave a title that nests them alone rather than guess which one counts.
+	if seriesPrefixRe.MatchString(rest) {
+		return "", "", "", false
+	}
+	if genericSeriesWords[strings.ToLower(strings.TrimSuffix(name, "."))] {
+		name = ""
+	}
+	// "03" is position 3; keep "0.5" as written.
+	if trimmed := strings.TrimLeft(index, "0"); trimmed != "" && trimmed[0] != '.' {
+		index = trimmed
+	}
+	return name, index, rest, true
 }
 
 // sanitizeSeriesName rejects series values that are really genre labels.

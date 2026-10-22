@@ -103,6 +103,8 @@ func Match(local MatchInput, cand MatchCandidate) Confidence {
 // "The Hobbit" and "Hobbit, The" compare equal.
 func normalizeForCompare(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
+	// "Roc & a Hard Place" and "Roc and a Hard Place" are the same book.
+	s = strings.ReplaceAll(s, "&", " and ")
 	var b strings.Builder
 	for _, r := range s {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
