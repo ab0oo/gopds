@@ -165,6 +165,20 @@ func TestSendPlainAuth(t *testing.T) {
 	}
 }
 
+func TestHeloName(t *testing.T) {
+	for _, tc := range []struct{ hostname, from, want string }{
+		{"books.example.net", "gopds@example.com", "books.example.net"},
+		{"3f2a9c1b7d4e", "gopds@example.com", "example.com"},
+		{"localhost.localdomain", "Books <gopds@example.com>", "example.com"},
+		{"", "gopds@example.com", "example.com"},
+		{"3f2a9c1b7d4e", "gopds@intranet", "localhost"},
+	} {
+		if got := heloName(tc.hostname, tc.from); got != tc.want {
+			t.Errorf("heloName(%q, %q) = %q, want %q", tc.hostname, tc.from, got, tc.want)
+		}
+	}
+}
+
 func TestSendFallsBackToLoginAuth(t *testing.T) {
 	srv := runSend(t, "LOGIN")
 	if srv.auth != "LOGIN books@example.com:s3cret" {
