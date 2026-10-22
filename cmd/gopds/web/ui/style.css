@@ -199,6 +199,8 @@ button {
 
 .edit-toggle,
 .book-info,
+.book-email,
+#email-send,
 .change-cover,
 #modal-save,
 #ol-fetch,
@@ -223,6 +225,41 @@ button {
     width: 100%;
     background: #2a243f;
     border-color: #4f4380;
+}
+
+.book-email {
+    width: 100%;
+    background: #1d2b3f;
+    border-color: #3a5a85;
+}
+
+.email-modal-dialog {
+    width: min(480px, calc(100vw - 32px));
+}
+
+.email-form {
+    display: grid;
+    gap: 8px;
+}
+
+.email-form label {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+}
+
+.email-form input {
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: #0c1218;
+    color: var(--text-main);
+    padding: 9px 10px;
+    font-size: 0.95rem;
+}
+
+.email-hint {
+    margin: 0;
+    font-size: 0.8rem;
+    color: var(--text-muted);
 }
 
 .change-cover {
