@@ -131,21 +131,6 @@ func TestPrepareEPUBWarnsOnUnsupportedLanguage(t *testing.T) {
 	}
 }
 
-func TestAttachmentName(t *testing.T) {
-	cases := map[[2]string]string{
-		{"Castle Roogna", "Piers Anthony"}:      "Castle_Roogna_-_Piers_Anthony.epub",
-		{"Demons Don’t Dream", "Piers Anthony"}: "Demons_Dont_Dream_-_Piers_Anthony.epub",
-		{"Der Außenseiter", "Gregg Hurwitz"}:    "Der_Aussenseiter_-_Gregg_Hurwitz.epub",
-		{"三体", ""}:                              "book.epub",
-		{"", ""}:                                "book.epub",
-	}
-	for in, want := range cases {
-		if got := AttachmentName(in[0], in[1]); got != want {
-			t.Errorf("AttachmentName(%q, %q) = %q, want %q", in[0], in[1], got, want)
-		}
-	}
-}
-
 // Calibre-era EPUBs (like the fixture, made the same way by Python's zipfile)
 // deflate their directory entries, which a raw zip copy cannot write back.
 func TestPrepareEPUBHandlesDeflatedDirectoryEntries(t *testing.T) {

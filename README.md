@@ -17,7 +17,8 @@ It builds to a single static binary (pure-Go SQLite, no CGO) and ships as a ~21M
 - Public book access:
   - OPDS feeds
   - JSON list (`/api/books`)
-  - Book downloads (`/download/{id}`)
+  - Book downloads (`/download/{id}`), named `Author - Title.epub` from the book's
+    metadata rather than the server's filename
   - Email Book: send a book to a Kindle's Send to Kindle address, when SMTP is configured
 - Authenticated admin editing:
   - Live EPUB metadata edit/write
@@ -66,7 +67,7 @@ All configuration is via environment variables.
 | `SMTP_SERVER` | *(none)* | SMTP server for Email Book. Email Book appears only when `SMTP_SERVER`, `SMTP_PORT`, `SMTP_USER` and `SMTP_PASS` are all set. |
 | `SMTP_PORT` | *(none)* | SMTP port. `465` uses implicit TLS; other ports use STARTTLS when offered. |
 | `SMTP_USER` | *(none)* | SMTP login. |
-| `SMTP_PASS` | *(none)* | SMTP password. Never sent over an unencrypted connection. |
+| `SMTP_PASS` | *(none)* | SMTP password. Never sent over an unencrypted connection, except to a server on localhost. |
 | `SMTP_FROM` | `SMTP_USER` | Sender address, for providers whose login is not an email address. |
 | `EMAIL_ALLOWED_DOMAINS` | `kindle.com,free.kindle.com,kindle.cn` | Recipient domains Email Book accepts, comma-separated. `*` allows any address. |
 | `LISTEN_ADDR` | `:8880` | Address the HTTP server binds to. |
@@ -263,7 +264,8 @@ Setup:
 
 1. Set all of `SMTP_SERVER`, `SMTP_PORT`, `SMTP_USER` and `SMTP_PASS` (and
    `SMTP_FROM` if the login is not an email address). Until all four are set the
-   button is not shown; if only some are, the startup log names the missing ones.
+   button is not shown; if `SMTP_SERVER`, `SMTP_USER` or `SMTP_PASS` is set
+   without the others, the startup log names the missing ones.
 2. Each reader adds the sender address to **Amazon > Manage Your Content and
    Devices > Preferences > Personal Document Settings > Approved Personal Document
    E-mail List**. Amazon silently discards mail from any other sender. The Email
@@ -282,8 +284,9 @@ itself is never changed:
   to their language code. Languages Kindle does not support are left alone and
   reported back.
 
-The attachment is sent as `application/epub+zip` with a plain-ASCII filename,
-since accented filenames are a known cause of rejection. Send to Kindle accepts
+The attachment is sent as `application/epub+zip` under a plain-ASCII form of
+the download name (`Piers_Anthony_-_Castle_Roogna.epub`), since accented
+filenames are a known cause of rejection. Send to Kindle accepts
 at most 50 MB per email, so larger books are refused with a message; your SMTP
 provider may have a lower message limit (base64 adds about a third).
 
@@ -354,7 +357,7 @@ GitHub Actions workflow:
   hour per client address, and runs at most two sends at once. Behind a reverse
   proxy all visitors share the proxy's address, and therefore that limit.
 - Outbound cover fetches are restricted to an allowlist of Open Library, Google Books,
-  and Wikimedia hosts.
+  Wikipedia and Wikimedia hosts.
 - Protect `main` with required signed commits.
 - Keep GHCR package visibility intentional (public/private).
 

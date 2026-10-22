@@ -90,7 +90,7 @@ func TestHandleEmailBook(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if resp.Filename != "Castle_Roogna_-_Piers_Anthony.epub" || len(resp.Fixes) == 0 {
+	if resp.Filename != "Piers_Anthony_-_Castle_Roogna.epub" || len(resp.Fixes) == 0 {
 		t.Errorf("response %+v", resp)
 	}
 	if len(*sent) != 1 || !strings.HasPrefix((*sent)[0], "reader@kindle.com\n") ||
