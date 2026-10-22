@@ -1540,6 +1540,21 @@ func (s *Server) HandleUpdateMetadata(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Category comes from the subjects just written, and goes stale the same
+	// way series did.
+	subjects := req.Subjects
+	if meta != nil {
+		subjects = meta.Subjects
+	}
+	libraryRoot := strings.TrimSpace(os.Getenv("BOOK_PATH"))
+	if libraryRoot == "" {
+		libraryRoot = "./books"
+	}
+	category, subcategory := scanner.BookCategories(libraryRoot, bookPath, subjects)
+	if err := s.db.UpdateBookCategory(book.ID, category, subcategory, info.ModTime()); err != nil {
+		http.Error(w, "Failed to update metadata cache", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if meta == nil {

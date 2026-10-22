@@ -736,17 +736,7 @@ func (s *Scanner) Start(root string) error {
 			ModTime:     info.ModTime(),
 			RelPath:     relPath,
 		}
-		switch categorySource {
-		case "path":
-			book.Category, book.Subcategory = categoriesFromPath(realPath, path)
-		case "subject":
-			book.Category, book.Subcategory = categoriesFromSubjects(meta.Subjects)
-		case "auto":
-			book.Category, book.Subcategory = categoriesFromSubjects(meta.Subjects)
-			if book.Category == "" {
-				book.Category, book.Subcategory = categoriesFromPath(realPath, path)
-			}
-		}
+		book.Category, book.Subcategory = categoriesFor(categorySource, realPath, path, meta.Subjects)
 
 		id, err := s.db.SaveBookTx(tx, book)
 		if err != nil {
@@ -832,6 +822,32 @@ func resolveCategorySource() string {
 	default:
 		return "none"
 	}
+}
+
+// BookCategories files a book under a category and subcategory the way a scan
+// does, by CATEGORY_SOURCE: from its subjects, from its directory under the
+// library root, or both. Callers that change a book's subjects without a scan
+// use it to keep the stored category in step.
+func BookCategories(root, bookPath string, subjects []string) (string, string) {
+	if realRoot, err := filepath.EvalSymlinks(root); err == nil {
+		root = realRoot
+	}
+	return categoriesFor(resolveCategorySource(), root, bookPath, subjects)
+}
+
+func categoriesFor(source, root, bookPath string, subjects []string) (string, string) {
+	switch source {
+	case "path":
+		return categoriesFromPath(root, bookPath)
+	case "subject":
+		return categoriesFromSubjects(subjects)
+	case "auto":
+		if category, subcategory := categoriesFromSubjects(subjects); category != "" {
+			return category, subcategory
+		}
+		return categoriesFromPath(root, bookPath)
+	}
+	return "", ""
 }
 
 func categoriesFromPath(root, bookPath string) (string, string) {

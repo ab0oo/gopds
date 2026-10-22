@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ab0oo/gopds/internal/normalize"
 	_ "modernc.org/sqlite" // Pure Go driver, no CGO needed
 )
 
@@ -129,7 +130,56 @@ func New(dbPath string) (*DB, error) {
 		return nil, err
 	}
 
-	return &DB{conn: db}, nil
+	d := &DB{conn: db}
+	if err := d.normalizeCategoryLabels(); err != nil {
+		return nil, fmt.Errorf("normalize category labels: %w", err)
+	}
+	return d, nil
+}
+
+// normalizeCategoryLabels rewrites stored categories and subcategories into
+// normalize.CategoryLabel form. Labels are cleaned as books are saved, but an
+// unchanged file is never re-read, so rows saved before that would otherwise
+// keep variants like "Fantasy fiction" beside "Fantasy Fiction" until a full
+// rebuild. Only the distinct pairs are read, so this is cheap to run at every
+// start.
+func (db *DB) normalizeCategoryLabels() error {
+	rows, err := db.conn.Query(`SELECT DISTINCT coalesce(category,''), coalesce(subcategory,'') FROM books`)
+	if err != nil {
+		return err
+	}
+	type pair struct{ category, subcategory string }
+	var stale []pair
+	for rows.Next() {
+		var p pair
+		if err := rows.Scan(&p.category, &p.subcategory); err != nil {
+			rows.Close()
+			return err
+		}
+		if normalize.CategoryLabel(p.category) != p.category || normalize.CategoryLabel(p.subcategory) != p.subcategory {
+			stale = append(stale, p)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(stale) == 0 {
+		return nil
+	}
+
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, p := range stale {
+		if _, err := tx.Exec(`UPDATE books SET category = ?, subcategory = ? WHERE coalesce(category,'') = ? AND coalesce(subcategory,'') = ?`,
+			normalize.CategoryLabel(p.category), normalize.CategoryLabel(p.subcategory), p.category, p.subcategory); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // NeedsReScan checks if the file at 'path' has been modified since last scan
@@ -145,7 +195,7 @@ func (db *DB) NeedsReScan(path string, currentModTime time.Time) bool {
 func (db *DB) SaveBook(b Book) (int64, error) {
 	var id int64
 	err := db.conn.QueryRow(saveBookSQL, b.Path, b.Title, b.Author, b.Description,
-		b.Category, b.Subcategory, b.Series, b.SeriesIndex, b.ModTime, b.RelPath).Scan(&id)
+		normalize.CategoryLabel(b.Category), normalize.CategoryLabel(b.Subcategory), b.Series, b.SeriesIndex, b.ModTime, b.RelPath).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
@@ -159,7 +209,7 @@ func (db *DB) Begin() (*sql.Tx, error) {
 func (db *DB) SaveBookTx(tx *sql.Tx, b Book) (int64, error) {
 	var id int64
 	err := tx.QueryRow(saveBookSQL, b.Path, b.Title, b.Author, b.Description,
-		b.Category, b.Subcategory, b.Series, b.SeriesIndex, b.ModTime, b.RelPath).Scan(&id)
+		normalize.CategoryLabel(b.Category), normalize.CategoryLabel(b.Subcategory), b.Series, b.SeriesIndex, b.ModTime, b.RelPath).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
@@ -172,6 +222,18 @@ func (db *DB) UpdateBookMetadata(id int, title, author, description string, modT
 	SET title = ?, author = ?, description = ?, mod_time = ?
 	WHERE id = ?`
 	_, err := db.conn.Exec(query, title, author, description, modTime, id)
+	return err
+}
+
+// UpdateBookCategory records a book's category and subcategory. modTime
+// should be the EPUB's new mod time so the next incremental scan does not
+// re-read the file.
+func (db *DB) UpdateBookCategory(id int, category, subcategory string, modTime time.Time) error {
+	query := `
+	UPDATE books
+	SET category = ?, subcategory = ?, mod_time = ?
+	WHERE id = ?`
+	_, err := db.conn.Exec(query, normalize.CategoryLabel(category), normalize.CategoryLabel(subcategory), modTime, id)
 	return err
 }
 
