@@ -13,6 +13,12 @@ services:
       - ADMIN_USERNAME=admin
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
       - GOOGLE_BOOKS_API_KEY=${GOOGLE_BOOKS_API_KEY}
+      # Email Book (Send to Kindle); leave SMTP_SERVER unset to turn it off
+      - SMTP_SERVER=${SMTP_SERVER:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - SMTP_FROM=${SMTP_FROM:-}
     volumes:
        - /var/www/books:/app/books
        - /var/lib/gopds:/app/data

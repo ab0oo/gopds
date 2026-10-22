@@ -42,6 +42,8 @@ const App = {
     itemsPerPage: 50,
     modalBookId: null,
     infoModalBookId: null,
+    email: { enabled: false, from: '', domains: [] },
+    emailModalBookId: null,
     coverModalBookId: null,
     openLibraryResults: [],
     selectedOpenLibrary: null,
@@ -81,10 +83,12 @@ const App = {
     async init() {
         this.createModal();
         this.createInfoModal();
+        this.createEmailModal();
         this.createCoverModal();
         this.createReviewModal();
         this.bindEvents();
         await this.syncAuthStatus();
+        await this.syncEmailStatus();
         await this.fetchLibrary();
         await this.syncRebuildStatus();
     },
@@ -193,6 +197,14 @@ const App = {
         });
         this.ui.infoModalClose.addEventListener('click', () => this.closeInfoModal());
 
+        this.ui.emailModal.addEventListener('click', (e) => {
+            if (e.target.dataset.closeEmailModal === '1') {
+                this.closeEmailModal();
+            }
+        });
+        this.ui.emailModalClose.addEventListener('click', () => this.closeEmailModal());
+        this.ui.emailForm.addEventListener('submit', (e) => this.sendBookEmail(e));
+
         this.ui.modal.addEventListener('click', (e) => {
             if (e.target.dataset.closeModal === '1') {
                 this.closeModal();
@@ -251,6 +263,8 @@ const App = {
                 this.closeCoverModal();
             } else if (!this.ui.infoModal.classList.contains('hidden')) {
                 this.closeInfoModal();
+            } else if (!this.ui.emailModal.classList.contains('hidden')) {
+                this.closeEmailModal();
             } else if (this.ui.reviewModal && !this.ui.reviewModal.classList.contains('hidden')) {
                 this.closeReviewModal();
             }
@@ -278,6 +292,41 @@ const App = {
         this.ui.infoModalClose = modal.querySelector('#info-modal-close');
         this.ui.infoModalBook = modal.querySelector('#info-modal-book');
         this.ui.infoModalFields = modal.querySelector('#info-modal-fields');
+    },
+
+    createEmailModal() {
+        const modal = document.createElement('div');
+        modal.id = 'email-modal';
+        modal.className = 'modal hidden';
+        modal.innerHTML = `
+            <div class="modal-backdrop" data-close-email-modal="1"></div>
+            <div class="modal-dialog email-modal-dialog" role="dialog" aria-modal="true" aria-label="Email book">
+                <div class="modal-header">
+                    <h2>Email Book</h2>
+                    <button type="button" id="email-modal-close" class="modal-close" aria-label="Close">&times;</button>
+                </div>
+                <div class="modal-book" id="email-modal-book"></div>
+                <form id="email-form" class="email-form">
+                    <label for="email-to">Send to Kindle address</label>
+                    <input id="email-to" type="email" required autocomplete="email" placeholder="you@kindle.com">
+                    <p class="email-hint" id="email-hint"></p>
+                    <div class="modal-actions">
+                        <button type="submit" id="email-send">Send</button>
+                        <div class="edit-status" id="email-status" role="status"></div>
+                    </div>
+                </form>
+            </div>
+        `;
+
+        document.body.appendChild(modal);
+        this.ui.emailModal = modal;
+        this.ui.emailModalClose = modal.querySelector('#email-modal-close');
+        this.ui.emailModalBook = modal.querySelector('#email-modal-book');
+        this.ui.emailForm = modal.querySelector('#email-form');
+        this.ui.emailTo = modal.querySelector('#email-to');
+        this.ui.emailHint = modal.querySelector('#email-hint');
+        this.ui.emailSend = modal.querySelector('#email-send');
+        this.ui.emailStatus = modal.querySelector('#email-status');
     },
 
     createCoverModal() {
@@ -727,6 +776,16 @@ const App = {
             return;
         }
 
+        const emailButton = e.target.closest('.book-email');
+        if (emailButton) {
+            const id = Number(emailButton.dataset.bookId);
+            const book = this.allBooks.find((b) => b.id === id);
+            if (book) {
+                this.openEmailModal(book);
+            }
+            return;
+        }
+
         const infoButton = e.target.closest('.book-info');
         if (infoButton) {
             const id = Number(infoButton.dataset.bookId);
@@ -835,6 +894,103 @@ const App = {
     closeInfoModal() {
         this.infoModalBookId = null;
         this.ui.infoModal.classList.add('hidden');
+    },
+
+    // syncEmailStatus asks whether the server can email books; the button is
+    // only shown when it can.
+    async syncEmailStatus() {
+        try {
+            const response = await fetch('/api/email/status');
+            if (response.ok) {
+                const data = await response.json();
+                this.email = {
+                    enabled: Boolean(data.enabled),
+                    from: data.from || '',
+                    domains: Array.isArray(data.domains) ? data.domains : []
+                };
+            }
+        } catch (err) {
+            console.error(err);
+        }
+    },
+
+    savedEmailAddress() {
+        try {
+            return localStorage.getItem('gopds.emailTo') || '';
+        } catch (err) {
+            return '';
+        }
+    },
+
+    openEmailModal(book) {
+        this.emailModalBookId = book.id;
+        this.ui.emailModalBook.textContent = `${book.title || 'Untitled'}${book.author ? ' | ' + book.author : ''}`;
+        this.ui.emailTo.value = this.savedEmailAddress();
+        this.ui.emailStatus.textContent = '';
+        this.ui.emailSend.disabled = false;
+
+        const hints = [];
+        if (this.email.domains.length) {
+            hints.push(`Books can be sent to ${this.email.domains.map((d) => '@' + d).join(', ')} addresses.`);
+        }
+        if (this.email.from) {
+            hints.push(`Kindle only accepts it if ${this.email.from} is on your Amazon "Approved Personal Document E-mail List".`);
+        }
+        this.ui.emailHint.textContent = hints.join(' ');
+
+        this.ui.emailModal.classList.remove('hidden');
+        this.ui.emailTo.focus();
+    },
+
+    closeEmailModal() {
+        this.emailModalBookId = null;
+        this.ui.emailModal.classList.add('hidden');
+    },
+
+    async sendBookEmail(e) {
+        e.preventDefault();
+        const bookId = this.emailModalBookId;
+        const to = (this.ui.emailTo.value || '').trim();
+        if (!bookId || !to) {
+            return;
+        }
+        try {
+            localStorage.setItem('gopds.emailTo', to);
+        } catch (err) {
+            // Remembering the address is a convenience only.
+        }
+
+        this.ui.emailSend.disabled = true;
+        this.ui.emailStatus.textContent = 'Sending...';
+        try {
+            const response = await fetch(`/api/books/${bookId}/email`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ to })
+            });
+            if (!response.ok) {
+                const msg = await response.text();
+                throw new Error(msg.trim() || `Sending failed (${response.status})`);
+            }
+            const data = await response.json();
+            if (this.emailModalBookId !== bookId) {
+                return;
+            }
+            const notes = [];
+            if (data.fixes && data.fixes.length) {
+                notes.push(`${data.fixes.length} Kindle compatibility fix${data.fixes.length === 1 ? '' : 'es'} applied`);
+            }
+            if (data.warnings && data.warnings.length) {
+                notes.push(`warning: ${data.warnings.join('; ')}`);
+            }
+            this.ui.emailStatus.textContent =
+                `Sent to ${data.to}. It should reach your Kindle within a few minutes.${notes.length ? ' (' + notes.join('; ') + ')' : ''}`;
+        } catch (err) {
+            this.ui.emailStatus.textContent = `Error: ${err.message}`;
+            console.error(err);
+        } finally {
+            this.ui.emailSend.disabled = false;
+        }
     },
 
     closeCoverModal() {
@@ -1737,6 +1893,7 @@ const App = {
             ${badge}
             <div class="book-actions">
                 <a class="book-download" href="/download/${book.id}">Download</a>
+                ${this.email.enabled ? `<button type="button" class="book-email" data-book-id="${book.id}">Email Book</button>` : ''}
                 <button type="button" class="book-info" data-book-id="${book.id}">Book Info</button>
                 ${this.auth.authenticated ? `<button type="button" class="edit-toggle" data-book-id="${book.id}">Edit Metadata</button>` : ''}
                 ${this.auth.authenticated ? `<button type="button" class="change-cover" data-book-id="${book.id}">Change Cover</button>` : ''}

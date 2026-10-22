@@ -49,6 +49,9 @@ type Server struct {
 
 	enrichOnce sync.Once
 	enricher   *enricher
+
+	emailOnce sync.Once
+	email     *emailState
 }
 
 type authSession struct {
@@ -236,13 +239,15 @@ func NewServer(db *database.DB, uiFS embed.FS) *Server {
 		log.Printf("warning: ADMIN_PASSWORD is empty; authenticated features are disabled until it is set")
 	}
 
-	return &Server{
+	s := &Server{
 		db:        db,
 		uiFS:      uiFS,
 		adminUser: adminUser,
 		adminPass: adminPass,
 		sessions:  make(map[string]authSession),
 	}
+	s.emailState() // report SMTP configuration problems at startup
+	return s
 }
 
 func (s *Server) Router() http.Handler {
@@ -292,6 +297,8 @@ func (s *Server) Router() http.Handler {
 	r.Get("/api/openlibrary/search", s.HandleOpenLibrarySearch)
 	r.Get("/covers/{id}.jpg", s.HandleCover)
 	r.Get("/download/{id}", s.HandleDownload)
+	r.Get("/api/email/status", s.HandleEmailStatus)
+	r.Post("/api/books/{id}/email", s.HandleEmailBook)
 
 	r.Handle("/*", http.FileServer(http.FS(publicFS)))
 	return r

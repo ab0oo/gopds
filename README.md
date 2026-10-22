@@ -18,6 +18,7 @@ It builds to a single static binary (pure-Go SQLite, no CGO) and ships as a ~21M
   - OPDS feeds
   - JSON list (`/api/books`)
   - Book downloads (`/download/{id}`)
+  - Email Book: send a book to a Kindle's Send to Kindle address, when SMTP is configured
 - Authenticated admin editing:
   - Live EPUB metadata edit/write
   - Open Library + Google Books compare/apply workflow
@@ -62,6 +63,12 @@ All configuration is via environment variables.
 | `ONLINE_COVER_MIN_HEIGHT` | `420` | Online cover candidates shorter than this are discarded. Wikipedia covers use a floor of 300. |
 | `ENRICH_RATE_MS` | `1000` | Milliseconds between upstream lookups during background enrichment. |
 | `GOOGLE_BOOKS_API_KEY` | *(none)* | Optional Google Books API key. Without one, lookups share Google's small anonymous quota. |
+| `SMTP_SERVER` | *(none)* | SMTP server for Email Book. Email Book appears only when `SMTP_SERVER`, `SMTP_PORT`, `SMTP_USER` and `SMTP_PASS` are all set. |
+| `SMTP_PORT` | *(none)* | SMTP port. `465` uses implicit TLS; other ports use STARTTLS when offered. |
+| `SMTP_USER` | *(none)* | SMTP login. |
+| `SMTP_PASS` | *(none)* | SMTP password. Never sent over an unencrypted connection. |
+| `SMTP_FROM` | `SMTP_USER` | Sender address, for providers whose login is not an email address. |
+| `EMAIL_ALLOWED_DOMAINS` | `kindle.com,free.kindle.com,kindle.cn` | Recipient domains Email Book accepts, comma-separated. `*` allows any address. |
 | `LISTEN_ADDR` | `:8880` | Address the HTTP server binds to. |
 
 The server listens on port `8880` by default (see `LISTEN_ADDR`).
@@ -100,6 +107,10 @@ services:
       - ADMIN_USERNAME=admin
       - ADMIN_PASSWORD=${GOPDS_ADMIN_PASSWORD:?set this in a .env file}
       - GOOGLE_BOOKS_API_KEY=${GOOGLE_BOOKS_API_KEY:-} # optional
+      - SMTP_SERVER=${SMTP_SERVER:-}                     # optional, enables Email Book
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
     volumes:
       - /path/to/books:/app/books
       - /path/to/gopds-data:/app/data
@@ -149,6 +160,8 @@ Public:
 - `GET /api/books`
 - `GET /covers/{id}.jpg`
 - `GET /download/{id}`
+- `GET /api/email/status`
+- `POST /api/books/{id}/email`
 - `GET /api/openlibrary/search`
 
 Auth/session:
@@ -240,6 +253,40 @@ returns the worst-scoring books first. The **Metadata Review** button in the web
 UI (admin only) presents the same queue with per-book Edit, Cover, Resolve and
 Lock actions, plus the enrichment and cover-upgrade controls.
 
+## Email Book (Send to Kindle)
+
+With SMTP configured, each book card gets an **Email Book** button that sends
+the EPUB to a Kindle's Send to Kindle address (`name@kindle.com`). Amazon
+converts EPUBs sent this way and delivers them to the reader's devices.
+
+Setup:
+
+1. Set all of `SMTP_SERVER`, `SMTP_PORT`, `SMTP_USER` and `SMTP_PASS` (and
+   `SMTP_FROM` if the login is not an email address). Until all four are set the
+   button is not shown; if only some are, the startup log names the missing ones.
+2. Each reader adds the sender address to **Amazon > Manage Your Content and
+   Devices > Preferences > Personal Document Settings > Approved Personal Document
+   E-mail List**. Amazon silently discards mail from any other sender. The Email
+   Book dialog shows which address to approve.
+
+Each book is repaired for Send to Kindle on the way out, following
+[kindle-epub-fix](https://github.com/innocenat/kindle-epub-fix). The library file
+itself is never changed:
+
+- pages without an encoding declaration get a UTF-8 one (Amazon otherwise
+  assumes ISO-8859-1 and garbles accented characters);
+- links to a page's `<body>` id are pointed at the page itself;
+- image tags with no source are removed;
+- a missing or undetermined (`und`) language becomes `en`, since Kindle refuses
+  books without one, and free-text values like `US English (en-us)` are reduced
+  to their language code. Languages Kindle does not support are left alone and
+  reported back.
+
+The attachment is sent as `application/epub+zip` with a plain-ASCII filename,
+since accented filenames are a known cause of rejection. Send to Kindle accepts
+at most 50 MB per email, so larger books are refused with a message; your SMTP
+provider may have a lower message limit (base64 adds about a third).
+
 ## UI Notes
 
 - Browser UI is at `/`.
@@ -302,6 +349,10 @@ GitHub Actions workflow:
   marked `Secure` when the server itself terminates TLS.
 - Note that `/api/books` and `/download/{id}` are unauthenticated: anyone who can reach
   the server can enumerate and download the library.
+- Email Book is unauthenticated too, like downloads. It can only send to the
+  `EMAIL_ALLOWED_DOMAINS` (Kindle addresses by default), is limited to 20 emails an
+  hour per client address, and runs at most two sends at once. Behind a reverse
+  proxy all visitors share the proxy's address, and therefore that limit.
 - Outbound cover fetches are restricted to an allowlist of Open Library, Google Books,
   and Wikimedia hosts.
 - Protect `main` with required signed commits.
