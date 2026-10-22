@@ -1414,6 +1414,32 @@ const App = {
     // findSeriesBooks asks the server which series this book belongs to and
     // which other library books are volumes of it. Nothing is written here;
     // the result is a proposal the user confirms per series.
+    // Wikidata answers 429 when it is called too often and bans clients that
+    // keep going, so after one both lookup buttons stay off until its
+    // Retry-After has passed, with a countdown in place of the error.
+    holdWikidataButtons(seconds) {
+        this.wikidataHoldUntil = Date.now() + seconds * 1000;
+        clearInterval(this.wikidataHoldTimer);
+        const tick = () => {
+            const left = Math.ceil((this.wikidataHoldUntil - Date.now()) / 1000);
+            const held = left > 0;
+            this.ui.seriesFind.disabled = held;
+            this.ui.seriesCleanup.disabled = held;
+            if (held) {
+                this.ui.seriesStatus.textContent = `Wikidata is limiting requests. Try again in ${left} second${left === 1 ? '' : 's'}.`;
+                return;
+            }
+            clearInterval(this.wikidataHoldTimer);
+            this.ui.seriesStatus.textContent = 'Wikidata is available again.';
+        };
+        tick();
+        this.wikidataHoldTimer = setInterval(tick, 1000);
+    },
+
+    wikidataHeld() {
+        return (this.wikidataHoldUntil || 0) > Date.now();
+    },
+
     async findSeriesBooks() {
         if (!this.modalBookId) {
             return;
@@ -1423,6 +1449,9 @@ const App = {
             title: (this.ui.fieldInputs.title.value || '').trim(),
             author: (this.ui.fieldInputs.author.value || '').trim()
         });
+        if (this.wikidataHeld()) {
+            return;
+        }
         this.ui.seriesFind.disabled = true;
         this.ui.seriesResults.innerHTML = '';
         this.ui.seriesStatus.textContent = 'Looking up series on Wikidata...';
@@ -1430,6 +1459,10 @@ const App = {
         try {
             const response = await fetch(`/api/books/${bookId}/series/lookup?${params}`);
             if (!response.ok) {
+                if (response.status === 429) {
+                    this.holdWikidataButtons(parseInt(response.headers.get('Retry-After'), 10) || 60);
+                    return;
+                }
                 if (response.status === 401) {
                     await this.syncAuthStatus();
                 }
@@ -1453,7 +1486,7 @@ const App = {
             this.ui.seriesStatus.textContent = `Error: ${err.message}`;
             console.error(err);
         } finally {
-            this.ui.seriesFind.disabled = false;
+            this.ui.seriesFind.disabled = this.wikidataHeld();
         }
     },
 
@@ -1601,6 +1634,9 @@ const App = {
             title: (this.ui.fieldInputs.title.value || '').trim(),
             author: (this.ui.fieldInputs.author.value || '').trim()
         });
+        if (this.wikidataHeld()) {
+            return;
+        }
         this.ui.seriesCleanup.disabled = true;
         this.ui.seriesResults.innerHTML = '';
         this.ui.seriesStatus.textContent = 'Checking the series against Wikidata...';
@@ -1608,6 +1644,10 @@ const App = {
         try {
             const response = await fetch(`/api/books/${bookId}/series/cleanup?${params}`);
             if (!response.ok) {
+                if (response.status === 429) {
+                    this.holdWikidataButtons(parseInt(response.headers.get('Retry-After'), 10) || 60);
+                    return;
+                }
                 if (response.status === 401) {
                     await this.syncAuthStatus();
                 }
@@ -1631,7 +1671,7 @@ const App = {
             this.ui.seriesStatus.textContent = `Error: ${err.message}`;
             console.error(err);
         } finally {
-            this.ui.seriesCleanup.disabled = false;
+            this.ui.seriesCleanup.disabled = this.wikidataHeld();
         }
     },
 

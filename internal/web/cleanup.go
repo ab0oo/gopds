@@ -350,6 +350,12 @@ func (s *Server) HandleSeriesCleanup(w http.ResponseWriter, r *http.Request) {
 	var authors map[string][]string
 
 	found, err := findWikidataSeries(client, anchor.Title, anchor.Author)
+	// Wikidata being merely unavailable still leaves the titles to clean, but
+	// a rate limit is temporary: proposing title-only fixes now would undo
+	// what Wikidata would have corrected a minute later.
+	if writeWikidataPaused(w, err) {
+		return
+	}
 	if err != nil {
 		// Still useful without Wikidata: the titles alone can be cleaned.
 		log.Printf("[cleanup] wikidata lookup error book_id=%d title=%q err=%v", book.ID, anchor.Title, err)
@@ -360,9 +366,13 @@ func (s *Server) HandleSeriesCleanup(w http.ResponseWriter, r *http.Request) {
 			seriesName, anchorVolumeID, source = tidySeriesName(ws.Name), ws.BookID, "wikidata"
 			if a, err := fetchWikidataVolumeAuthors(client, ws.ID); err == nil {
 				authors = a
+			} else if writeWikidataPaused(w, err) {
+				return
 			} else {
 				log.Printf("[cleanup] wikidata authors error series=%s err=%v", ws.ID, err)
 			}
+		} else if writeWikidataPaused(w, err) {
+			return
 		} else {
 			log.Printf("[cleanup] wikidata members error series=%s err=%v", ws.ID, err)
 		}

@@ -73,7 +73,7 @@ type sparqlResponse struct {
 func runSPARQL(client *http.Client, query string) ([]map[string]string, error) {
 	endpoint := "https://query.wikidata.org/sparql?format=json&query=" + url.QueryEscape(query)
 	var raw sparqlResponse
-	if err := fetchJSON(client, endpoint, &raw); err != nil {
+	if err := fetchWikidataJSON(client, endpoint, &raw); err != nil {
 		return nil, err
 	}
 	rows := make([]map[string]string, 0, len(raw.Results.Bindings))
@@ -109,7 +109,7 @@ func findWikidataSeries(client *http.Client, title, author string) ([]wikidataSe
 	for _, q := range titleVariants(title) {
 		endpoint := "https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json&language=en&type=item&limit=10&search=" + url.QueryEscape(q)
 		var res wikidataSearchResponse
-		if err := fetchJSON(client, endpoint, &res); err != nil {
+		if err := fetchWikidataJSON(client, endpoint, &res); err != nil {
 			return nil, err
 		}
 		for _, hit := range res.Search {
@@ -365,6 +365,9 @@ func (s *Server) HandleSeriesLookup(w http.ResponseWriter, r *http.Request) {
 
 	client := &http.Client{Timeout: 20 * time.Second}
 	found, err := findWikidataSeries(client, anchor.Title, anchor.Author)
+	if writeWikidataPaused(w, err) {
+		return
+	}
 	if err != nil {
 		log.Printf("[series] wikidata lookup error book_id=%d title=%q err=%v", book.ID, anchor.Title, err)
 		http.Error(w, "Series lookup failed: Wikidata is unavailable", http.StatusBadGateway)
@@ -385,6 +388,10 @@ func (s *Server) HandleSeriesLookup(w http.ResponseWriter, r *http.Request) {
 		}
 		seenSeries[ws.ID] = struct{}{}
 		entries, err := fetchWikidataSeriesEntries(client, ws.ID)
+		// A partial answer would read as "no other books in this series".
+		if writeWikidataPaused(w, err) {
+			return
+		}
 		if err != nil {
 			log.Printf("[series] wikidata members error book_id=%d series=%s err=%v", book.ID, ws.ID, err)
 			continue
